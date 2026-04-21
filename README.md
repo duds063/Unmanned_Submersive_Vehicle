@@ -33,7 +33,7 @@ O diferencial deste projeto é a fidelidade da simulação, permitindo a transfe
 
 1. Clone o repositório:
    ```bash
-   git clone [https://github.com/duds063/usv-digital-twin.git](https://github.com/duds063/usv-digital-twin.git)
+   git clone [https://github.com/duds063/Unmanned_Submersive_Vehicle.git](https://github.com/duds063/Unmanned_Submersive_Vehicle.git)
 Instale as dependências:
 
 ```bash
