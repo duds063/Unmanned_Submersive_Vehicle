@@ -33,21 +33,23 @@ O diferencial deste projeto é a fidelidade da simulação, permitindo a transfe
 
 1. Clone o repositório:
    ```bash
-   git clone [https://github.com/seu-usuario/usv-digital-twin.git](https://github.com/seu-usuario/usv-digital-twin.git)
+   git clone [https://github.com/duds063/usv-digital-twin.git](https://github.com/duds063/usv-digital-twin.git)
 Instale as dependências:
 
-Bash
+```bash
 pip install -r requirements.txt
 Execute os testes de validação:
-
-Bash
+```
+```bash
 python physics_engine.py
 python control_engine.py
+```
 Inicie o servidor de visualização:
 
-Bash
+```bash
 python visualization_server.py
+```
 Metodologia Científica
 O projeto foi construído sobre uma esteira de pesquisa iniciada no ICS (Inertial Control Sandbox), focando na transição de sistemas inerciais simples para dinâmicas navais complexas. O uso de Domain Randomization durante o treino da IA garante que o controlador seja resiliente a variações de densidade da água e ruído eletromagnético nos sensores.
 
-Desenvolvido por Eduardo Souza Costa e Marcelo Henrique Valdierp.
+Desenvolvido por Eduardo Souza Costa e Marcelo Henrique Valdiero.
