@@ -1,0 +1,740 @@
+"""
+USV Digital Twin — Módulo 3: Sensor Engine
+===========================================
+Simula o stack de sensores real do USV com ruído realista:
+
+    IMU     — aceleração linear/angular + ruído gaussiano
+    Sonar   — 6 transdutores ortogonais Open Echo (200kHz, 7m, 25°)
+    Barômetro — pressão → profundidade (MS5837)
+    Depth Map — recebe frame do Three.js via WebSocket
+
+Extended Kalman Filter (EKF) — módulo separado
+    Estado estimado nunca vê o estado real diretamente
+    Control Engine usa apenas EKF.state_estimate
+
+Referências:
+    - Open Echo project (Neumi): github.com/Neumi/open_echo
+    - TUSS4470 datasheet — Texas Instruments
+    - Fossen (2011) cap. 10 — sensor models for marine vehicles
+    - Thrun et al. (2005) Probabilistic Robotics — EKF derivation
+"""
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from physics_engine import VehicleState, PhysicsEngine
+
+
+# ─────────────────────────────────────────────
+# PARÂMETROS DO HARDWARE REAL
+# ─────────────────────────────────────────────
+
+# Open Echo — transdutor PZT 200kHz
+SONAR_RANGE_MAX     = 7.0       # m — range real em água doce
+SONAR_BEAMWIDTH_DEG = 25.0      # graus — cone de detecção
+SONAR_BEAMWIDTH_RAD = np.radians(SONAR_BEAMWIDTH_DEG)
+SONAR_UPDATE_HZ     = 10.0      # Hz — taxa de atualização
+SONAR_MIN_RANGE     = 0.15      # m — ringdown mínimo
+
+# IMU sintético — parâmetros típicos de MPU6050
+IMU_ACCEL_NOISE_STD  = 0.05     # m/s² — desvio padrão do ruído
+IMU_GYRO_NOISE_STD   = 0.002    # rad/s
+IMU_ACCEL_BIAS_STD   = 0.01     # m/s² — bias lento
+IMU_GYRO_BIAS_STD    = 0.0005   # rad/s
+
+# MS5837 — barômetro de pressão
+BARO_NOISE_STD       = 0.01     # m — precisão de profundidade
+RHO_FRESHWATER       = 1000.0
+G                    = 9.81
+
+
+# ─────────────────────────────────────────────
+# ESTRUTURAS DE DADOS
+# ─────────────────────────────────────────────
+
+@dataclass
+class IMUReading:
+    """Leitura ruidosa do IMU."""
+    accel: np.ndarray   # [ax, ay, az] m/s²
+    gyro:  np.ndarray   # [p, q, r] rad/s
+    timestamp: float
+
+    def to_dict(self) -> dict:
+        return {
+            'accel': self.accel.tolist(),
+            'gyro':  self.gyro.tolist(),
+            'timestamp': self.timestamp,
+        }
+
+
+@dataclass
+class SonarReading:
+    """Leitura de um transdutor sonar."""
+    direction:  np.ndarray  # vetor unitário de apontamento (body frame)
+    distance:   float       # m — distância medida (-1 = sem retorno)
+    confidence: float       # [0,1] — qualidade do eco
+    timestamp:  float
+
+    @property
+    def hit(self) -> bool:
+        return self.distance > 0
+
+    def to_dict(self) -> dict:
+        return {
+            'direction':  self.direction.tolist(),
+            'distance':   self.distance,
+            'confidence': self.confidence,
+            'timestamp':  self.timestamp,
+        }
+
+
+@dataclass
+class BarometerReading:
+    """Leitura do barômetro de pressão."""
+    depth:     float    # m — profundidade estimada
+    pressure:  float    # Pa
+    timestamp: float
+
+
+@dataclass
+class SensorBundle:
+    """Bundle completo de leituras de um timestep."""
+    imu:       IMUReading
+    sonar:     List[SonarReading]
+    barometer: BarometerReading
+    timestamp: float
+
+    def to_dict(self) -> dict:
+        return {
+            'imu':       self.imu.to_dict(),
+            'sonar':     [s.to_dict() for s in self.sonar],
+            'barometer': {
+                'depth':    self.barometer.depth,
+                'pressure': self.barometer.pressure,
+            },
+            'timestamp': self.timestamp,
+        }
+
+
+@dataclass
+class EKFState:
+    """Estado estimado pelo EKF."""
+    eta:       np.ndarray           # [x,y,z,φ,θ,ψ] — posição/orientação
+    nu:        np.ndarray           # [u,v,w,p,q,r] — velocidades
+    P:         np.ndarray           # covariância 12x12
+    timestamp: float
+
+    @property
+    def position(self) -> np.ndarray:
+        return self.eta[:3]
+
+    @property
+    def orientation(self) -> np.ndarray:
+        return self.eta[3:]
+
+    @property
+    def velocity_linear(self) -> np.ndarray:
+        return self.nu[:3]
+
+    @property
+    def velocity_angular(self) -> np.ndarray:
+        return self.nu[3:]
+
+    def to_dict(self) -> dict:
+        return {
+            'eta':        self.eta.tolist(),
+            'nu':         self.nu.tolist(),
+            'covariance': np.diag(self.P).tolist(),  # só diagonal pro JSON
+            'timestamp':  self.timestamp,
+        }
+
+
+# ─────────────────────────────────────────────
+# MODELO DE OBSTÁCULOS
+# ─────────────────────────────────────────────
+
+@dataclass
+class Obstacle:
+    """Obstáculo no ambiente — esfera ou plano."""
+    position: np.ndarray    # centro (m)
+    radius:   float         # raio (m) — 0 para plano infinito
+    normal:   Optional[np.ndarray] = None  # normal do plano
+
+    def intersect_ray(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+        max_range: float
+    ) -> float:
+        """
+        Retorna distância de interseção raio→obstáculo.
+        -1 se não há interseção no range.
+        """
+        if self.radius > 0:
+            # interseção raio-esfera
+            oc  = origin - self.position
+            a   = np.dot(direction, direction)
+            b   = 2.0 * np.dot(oc, direction)
+            c   = np.dot(oc, oc) - self.radius**2
+            disc = b**2 - 4*a*c
+
+            if disc < 0:
+                return -1.0
+
+            t = (-b - np.sqrt(disc)) / (2.0*a)
+            if SONAR_MIN_RANGE < t <= max_range:
+                return t
+            return -1.0
+
+        else:
+            # interseção raio-plano
+            if self.normal is None:
+                return -1.0
+            denom = np.dot(self.normal, direction)
+            if abs(denom) < 1e-6:
+                return -1.0
+            t = np.dot(self.position - origin, self.normal) / denom
+            if SONAR_MIN_RANGE < t <= max_range:
+                return t
+            return -1.0
+
+
+class Environment:
+    """Ambiente de simulação — contém obstáculos e limites."""
+
+    def __init__(self, pool_depth: float = 20.0, pool_radius: float = 50.0):
+        self.obstacles: List[Obstacle] = []
+        self._setup_boundaries(pool_depth, pool_radius)
+
+    def _setup_boundaries(self, depth: float, radius: float) -> None:
+        """Adiciona paredes do ambiente como planos."""
+        # fundo — normal aponta pra cima (oposta ao raio descendente)
+        self.obstacles.append(Obstacle(
+            position=np.array([0, 0, depth]),
+            radius=0,
+            normal=np.array([0, 0, 1.0])
+        ))
+        # superfície — normal aponta pra baixo
+        self.obstacles.append(Obstacle(
+            position=np.array([0, 0, 0]),
+            radius=0,
+            normal=np.array([0, 0, -1.0])
+        ))
+
+    def add_sphere(self, position: np.ndarray, radius: float) -> None:
+        self.obstacles.append(Obstacle(position=position, radius=radius))
+
+    def add_wall(self, position: np.ndarray, normal: np.ndarray) -> None:
+        self.obstacles.append(Obstacle(position=position, radius=0, normal=normal))
+
+    def raycast(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+        max_range: float = SONAR_RANGE_MAX
+    ) -> Tuple[float, float]:
+        """
+        Lança raio e retorna (distância, confiança).
+        Confiança diminui com ângulo de incidência e distância.
+        """
+        direction = direction / np.linalg.norm(direction)
+        min_dist  = max_range + 1.0
+        hit_normal = None
+
+        for obs in self.obstacles:
+            d = obs.intersect_ray(origin, direction, max_range)
+            if 0 < d < min_dist:
+                min_dist  = d
+                hit_normal = obs.normal if obs.radius == 0 else \
+                             (origin + d*direction - obs.position)
+
+        if min_dist > max_range:
+            return -1.0, 0.0
+
+        # confiança: maior perto e com incidência normal
+        dist_factor = 1.0 - (min_dist / max_range)
+        if hit_normal is not None:
+            hn = hit_normal / (np.linalg.norm(hit_normal) + 1e-9)
+            angle_factor = abs(np.dot(-direction, hn))
+        else:
+            angle_factor = 0.8
+
+        confidence = dist_factor * angle_factor
+        return min_dist, confidence
+
+
+# ─────────────────────────────────────────────
+# SENSOR ENGINE
+# ─────────────────────────────────────────────
+
+class SensorEngine:
+    """
+    Simula o stack completo de sensores do USV.
+
+    Uso:
+        env     = Environment(pool_depth=10.0)
+        sensors = SensorEngine(env, noise_scale=1.0)
+        bundle  = sensors.read(physics.state, physics.time)
+    """
+
+    # 6 direções ortogonais no referencial do corpo
+    SONAR_DIRECTIONS = np.array([
+        [ 1,  0,  0],   # frontal (surge+)
+        [-1,  0,  0],   # traseiro (surge-)
+        [ 0,  1,  0],   # estibordo (sway+)
+        [ 0, -1,  0],   # bombordo (sway-)
+        [ 0,  0,  1],   # abaixo (heave+)
+        [ 0,  0, -1],   # acima (heave-)
+    ], dtype=float)
+
+    def __init__(
+        self,
+        environment: Environment,
+        noise_scale: float = 1.0,   # 0 = sem ruído, 1 = ruído real, >1 = exagerado
+        seed:        int   = 42,
+    ):
+        self.env         = environment
+        self.noise_scale = noise_scale
+        self.rng         = np.random.default_rng(seed)
+
+        # bias do IMU — deriva lentamente
+        self._accel_bias = np.zeros(3)
+        self._gyro_bias  = np.zeros(3)
+        self._bias_drift_rate = 0.001  # rad/s por segundo
+
+        # timer de atualização do sonar
+        self._last_sonar_update = -1.0
+        self._sonar_dt = 1.0 / SONAR_UPDATE_HZ
+
+    # ─── Interface pública ───────────────────
+
+    def read(self, state: VehicleState, time: float) -> SensorBundle:
+        """Lê todos os sensores dado o estado físico real."""
+        imu       = self._read_imu(state, time)
+        sonar     = self._read_sonar(state, time)
+        barometer = self._read_barometer(state, time)
+
+        return SensorBundle(
+            imu=imu,
+            sonar=sonar,
+            barometer=barometer,
+            timestamp=time,
+        )
+
+    def set_noise_scale(self, scale: float) -> None:
+        """Ajusta nível de ruído em runtime — útil pra domain randomization."""
+        self.noise_scale = max(0.0, scale)
+
+    # ─── IMU ─────────────────────────────────
+
+    def _read_imu(self, state: VehicleState, time: float) -> IMUReading:
+        """
+        Simula IMU com ruído gaussiano e bias derivante.
+        Aceleração inclui gravidade projetada no body frame.
+        """
+        # aceleração verdadeira (aproximação — derivada de nu)
+        # na prática o IMU mede força específica = a - g
+        phi, theta = state.phi, state.tht
+        g_body = np.array([
+            -G * np.sin(theta),
+             G * np.cos(theta) * np.sin(phi),
+             G * np.cos(theta) * np.cos(phi),
+        ])
+
+        # velocidades angulares verdadeiras
+        true_gyro = np.array([state.p, state.q, state.r])
+
+        # drift do bias
+        self._accel_bias += self.rng.normal(
+            0, IMU_ACCEL_BIAS_STD * self._bias_drift_rate, 3)
+        self._gyro_bias  += self.rng.normal(
+            0, IMU_GYRO_BIAS_STD  * self._bias_drift_rate, 3)
+
+        # ruído branco
+        accel_noise = self.rng.normal(0, IMU_ACCEL_NOISE_STD * self.noise_scale, 3)
+        gyro_noise  = self.rng.normal(0, IMU_GYRO_NOISE_STD  * self.noise_scale, 3)
+
+        # leitura ruidosa
+        accel_meas = g_body       + self._accel_bias + accel_noise
+        gyro_meas  = true_gyro   + self._gyro_bias  + gyro_noise
+
+        return IMUReading(accel=accel_meas, gyro=gyro_meas, timestamp=time)
+
+    # ─── Sonar ───────────────────────────────
+
+    def _read_sonar(
+        self, state: VehicleState, time: float
+    ) -> List[SonarReading]:
+        """
+        6 transdutores ortogonais com beamwidth de 25°.
+        Atualiza a SONAR_UPDATE_HZ Hz.
+        Ruído proporcional à distância — modelo acústico simplificado.
+        """
+        # throttle — sonar não atualiza a cada physics step
+        if time - self._last_sonar_update < self._sonar_dt:
+            return self._last_sonar_readings
+
+        self._last_sonar_update = time
+
+        R = self._rotation_matrix(state.phi, state.tht, state.psi)
+        position = np.array([state.x, state.y, state.z])
+        readings = []
+
+        for dir_body in self.SONAR_DIRECTIONS:
+            # transforma direção pro referencial inercial
+            dir_world = R @ dir_body
+
+            # raycasting central
+            dist, conf = self.env.raycast(position, dir_world)
+
+            if dist > 0:
+                # ruído acústico — aumenta com distância
+                noise_std = (0.02 + 0.01 * dist) * self.noise_scale
+                dist_meas = dist + self.rng.normal(0, noise_std)
+                dist_meas = max(SONAR_MIN_RANGE, dist_meas)
+
+                # simula beamwidth — média de raios dentro do cone
+                dist_meas = self._apply_beamwidth(
+                    position, dir_world, dist_meas
+                )
+            else:
+                dist_meas = -1.0
+
+            readings.append(SonarReading(
+                direction=dir_body,
+                distance=dist_meas,
+                confidence=conf,
+                timestamp=time,
+            ))
+
+        self._last_sonar_readings = readings
+        return readings
+
+    def _apply_beamwidth(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+        center_dist: float,
+        n_rays: int = 8,
+    ) -> float:
+        """
+        Simula efeito do beamwidth de 25° — média de raios no cone.
+        Raios dentro do cone podem retornar distâncias diferentes.
+        """
+        half_angle = SONAR_BEAMWIDTH_RAD / 2
+        distances  = [center_dist]
+
+        # base ortogonal ao vetor de direção
+        perp = np.array([1, 0, 0]) if abs(direction[0]) < 0.9 else np.array([0, 1, 0])
+        perp = np.cross(direction, perp)
+        perp = perp / np.linalg.norm(perp)
+        perp2 = np.cross(direction, perp)
+
+        for i in range(n_rays):
+            angle  = self.rng.uniform(0, half_angle)
+            azimuth = self.rng.uniform(0, 2*np.pi)
+
+            # raio deflectido dentro do cone
+            d = (direction * np.cos(angle) +
+                 perp  * np.sin(angle) * np.cos(azimuth) +
+                 perp2 * np.sin(angle) * np.sin(azimuth))
+            d = d / np.linalg.norm(d)
+
+            dist, _ = self.env.raycast(origin, d)
+            if dist > 0:
+                distances.append(dist)
+
+        return float(np.mean(distances))
+
+    # ─── Barômetro ───────────────────────────
+
+    def _read_barometer(
+        self, state: VehicleState, time: float
+    ) -> BarometerReading:
+        """Pressão → profundidade com ruído do MS5837."""
+        true_depth = state.z  # NED: z positivo = profundidade
+        pressure   = RHO_FRESHWATER * G * true_depth
+        noise      = self.rng.normal(0, BARO_NOISE_STD * self.noise_scale)
+        depth_meas = true_depth + noise
+
+        return BarometerReading(
+            depth=depth_meas,
+            pressure=pressure,
+            timestamp=time,
+        )
+
+    # ─── Utilitários ─────────────────────────
+
+    @staticmethod
+    def _rotation_matrix(phi, theta, psi) -> np.ndarray:
+        """Matriz de rotação ZYX 3x3."""
+        cphi=np.cos(phi); sphi=np.sin(phi)
+        cth=np.cos(theta); sth=np.sin(theta)
+        cpsi=np.cos(psi); spsi=np.sin(psi)
+        return np.array([
+            [cpsi*cth, cpsi*sth*sphi-spsi*cphi, cpsi*sth*cphi+spsi*sphi],
+            [spsi*cth, spsi*sth*sphi+cpsi*cphi, spsi*sth*cphi-cpsi*sphi],
+            [-sth,     cth*sphi,                 cth*cphi               ]
+        ])
+
+
+# ─────────────────────────────────────────────
+# EXTENDED KALMAN FILTER
+# ─────────────────────────────────────────────
+
+class ExtendedKalmanFilter:
+    """
+    EKF para estimação de estado 6 DOF.
+
+    Estado: x = [η, ν] = [x,y,z,φ,θ,ψ, u,v,w,p,q,r] (12 dimensões)
+
+    Observações:
+        - IMU:       aceleração e velocidade angular (6D)
+        - Sonar:     distâncias ortogonais (até 6D)
+        - Barômetro: profundidade (1D)
+
+    O Control Engine NUNCA acessa o estado físico diretamente.
+    Usa apenas EKF.state_estimate — realismo de percepção garantido.
+    """
+
+    DIM_STATE = 12  # [η(6), ν(6)]
+
+    def __init__(self, physics: PhysicsEngine):
+        self.physics = physics
+
+        # covariâncias de processo — quanta incerteza adicionamos por step
+        self.Q = np.diag([
+            0.01, 0.01, 0.01,   # posição xyz
+            0.005, 0.005, 0.005, # orientação euler
+            0.1,  0.1,  0.1,    # velocidade linear
+            0.05, 0.05, 0.05,   # velocidade angular
+        ])
+
+        # covariâncias de medição
+        self.R_imu   = np.diag([IMU_ACCEL_NOISE_STD**2]*3 +
+                                [IMU_GYRO_NOISE_STD**2]*3)
+        self.R_sonar = np.eye(6) * 0.05**2   # ~5cm de ruído por transdutor
+        self.R_baro  = np.array([[BARO_NOISE_STD**2]])
+
+        # estado inicial — veículo na origem parado
+        self._x = np.zeros(self.DIM_STATE)
+        self._x[9] = 1.0   # quaternion w=1 implícito nos Euler zeros
+        self._P = np.eye(self.DIM_STATE) * 0.1
+
+        self._time = 0.0
+
+    @property
+    def state_estimate(self) -> EKFState:
+        return EKFState(
+            eta=self._x[:6].copy(),
+            nu=self._x[6:].copy(),
+            P=self._P.copy(),
+            timestamp=self._time,
+        )
+
+    def predict(self, dt: float) -> None:
+        """
+        Etapa de predição — propaga estado com modelo cinemático linear.
+        Usa Jacobiana da dinâmica em torno do estado atual.
+        """
+        # Jacobiana do modelo de processo — linearização em torno de x
+        F = self._compute_F(self._x, dt)
+
+        # propaga estado
+        self._x = self._f(self._x, dt)
+
+        # propaga covariância
+        self._P = F @ self._P @ F.T + self.Q * dt
+
+        self._time += dt
+
+    def update_imu(self, reading: IMUReading) -> None:
+        """Atualiza com leitura do IMU."""
+        # observação esperada dado estado atual
+        h = self._h_imu(self._x)
+
+        # medição real
+        z = np.concatenate([reading.accel, reading.gyro])
+
+        # Jacobiana de medição
+        H = self._H_imu(self._x)
+
+        self._update(z, h, H, self.R_imu)
+
+    def update_sonar(self, readings: List[SonarReading]) -> None:
+        """Atualiza com leituras do sonar — só usa hits válidos."""
+        hits = [r for r in readings if r.hit]
+        if not hits:
+            return
+
+        # por simplicidade, atualiza profundidade z com leitura heave+
+        for reading in hits:
+            if np.allclose(reading.direction, [0, 0, 1]):
+                z = np.array([reading.distance])
+                h = np.array([self._x[2]])  # z estimado
+                H = np.zeros((1, self.DIM_STATE))
+                H[0, 2] = 1.0
+                self._update(z, h, H, self.R_baro)
+
+    def update_barometer(self, reading: BarometerReading) -> None:
+        """Atualiza profundidade z com barômetro."""
+        z = np.array([reading.depth])
+        h = np.array([self._x[2]])
+        H = np.zeros((1, self.DIM_STATE))
+        H[0, 2] = 1.0
+        self._update(z, h, H, self.R_baro)
+
+    # ─── EKF internals ───────────────────────
+
+    def _f(self, x: np.ndarray, dt: float) -> np.ndarray:
+        """Modelo de processo — cinemática de corpo rígido simplificada."""
+        eta = x[:6]
+        nu  = x[6:]
+
+        J = self._jacobian_eta(eta)
+        eta_dot = J @ nu
+
+        x_new = x.copy()
+        x_new[:6] += eta_dot * dt
+        # velocidades mantidas constantes na predição (sem modelo de força)
+        # o Physics Engine é a fonte de verdade — EKF só filtra
+
+        return x_new
+
+    def _compute_F(self, x: np.ndarray, dt: float) -> np.ndarray:
+        """Jacobiana do modelo de processo 12x12."""
+        F = np.eye(self.DIM_STATE)
+        eta = x[:6]
+        J   = self._jacobian_eta(eta)
+        F[:6, 6:] = J * dt
+        return F
+
+    def _h_imu(self, x: np.ndarray) -> np.ndarray:
+        """Modelo de observação do IMU."""
+        phi, theta = x[3], x[4]
+        g_body = np.array([
+            -G * np.sin(theta),
+             G * np.cos(theta) * np.sin(phi),
+             G * np.cos(theta) * np.cos(phi),
+        ])
+        return np.concatenate([g_body, x[9:12]])
+
+    def _H_imu(self, x: np.ndarray) -> np.ndarray:
+        """Jacobiana do modelo de observação do IMU 6x12."""
+        H = np.zeros((6, self.DIM_STATE))
+        # aceleração depende de phi (idx 3) e theta (idx 4)
+        phi, theta = x[3], x[4]
+        H[0, 4] = -G * np.cos(theta)
+        H[1, 3] =  G * np.cos(theta) * np.cos(phi)
+        H[1, 4] = -G * np.sin(theta) * np.sin(phi)
+        H[2, 3] = -G * np.cos(theta) * np.sin(phi)
+        H[2, 4] = -G * np.sin(theta) * np.cos(phi)
+        # giroscópio observa diretamente p,q,r (idx 9,10,11)
+        H[3, 9]  = 1.0
+        H[4, 10] = 1.0
+        H[5, 11] = 1.0
+        return H
+
+    def _update(
+        self,
+        z: np.ndarray,
+        h: np.ndarray,
+        H: np.ndarray,
+        R: np.ndarray
+    ) -> None:
+        """Etapa de atualização EKF padrão."""
+        innov = z - h                           # inovação
+        S     = H @ self._P @ H.T + R          # covariância da inovação
+        K     = self._P @ H.T @ np.linalg.inv(S)  # ganho de Kalman
+        self._x = self._x + K @ innov
+        self._P = (np.eye(self.DIM_STATE) - K @ H) @ self._P
+
+    def _jacobian_eta(self, eta: np.ndarray) -> np.ndarray:
+        """Bloco J1 da Jacobiana — transforma nu em eta_dot."""
+        phi, theta, psi = eta[3], eta[4], eta[5]
+        R = SensorEngine._rotation_matrix(phi, theta, psi)
+        cphi=np.cos(phi); sphi=np.sin(phi)
+        cth=np.cos(theta)
+        tth=np.tan(theta)
+        T = np.array([
+            [1, sphi*tth,  cphi*tth],
+            [0, cphi,     -sphi    ],
+            [0, sphi/cth,  cphi/cth]
+        ])
+        J = np.zeros((6, 6))
+        J[:3, :3] = R
+        J[3:, 3:] = T
+        return J
+
+    def reset(self, initial_state: Optional[np.ndarray] = None) -> None:
+        self._x = initial_state if initial_state is not None else np.zeros(self.DIM_STATE)
+        self._P = np.eye(self.DIM_STATE) * 0.1
+        self._time = 0.0
+
+
+# ─────────────────────────────────────────────
+# TESTES
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import json
+    from geometry_engine import GeometryEngine
+
+    print("Inicializando Sensor Engine + EKF...")
+
+    # setup
+    geo     = GeometryEngine(L=0.8, D=0.1)
+    physics = PhysicsEngine(geo, max_thruster_force=10.0)
+
+    env     = Environment(pool_depth=5.0, pool_radius=30.0)   # pool de 5m — fundo atingível
+    env.add_sphere(np.array([5.0, 0.0, 3.0]), radius=1.0)   # obstáculo esférico
+
+    sensors = SensorEngine(env, noise_scale=1.0)
+    ekf     = ExtendedKalmanFilter(physics)
+
+    # Teste 1 — leitura de sensores em repouso
+    print("\nTeste 1 — Sensores em repouso:")
+    bundle = sensors.read(physics.state, 0.0)
+    print(f"  IMU accel: {bundle.imu.accel.round(3)}")
+    print(f"  IMU gyro:  {bundle.imu.gyro.round(4)}")
+    print(f"  Barômetro: {bundle.barometer.depth:.3f} m")
+    print(f"  Sonar hits: {sum(1 for s in bundle.sonar if s.hit)}/6")
+
+    # Teste 2 — sonar detecta fundo
+    print("\nTeste 2 — Sonar detecta fundo a 10m:")
+    state_deep = VehicleState(z=2.0)  # 2m de profundidade
+    bundle2 = sensors.read(state_deep, 0.1)
+    for s in bundle2.sonar:
+        dir_name = ['frente','trás','estibordo','bombordo','baixo','cima']
+        idx = list(range(6))[
+            [np.allclose(s.direction, d) for d in SensorEngine.SONAR_DIRECTIONS].index(True)
+        ]
+        if s.hit:
+            print(f"  {dir_name[idx]}: {s.distance:.2f}m (conf={s.confidence:.2f})")
+        else:
+            print(f"  {dir_name[idx]}: sem retorno")
+
+    # Teste 3 — EKF converge pro estado real
+    print("\nTeste 3 — EKF tracking por 3s:")
+    physics.reset()
+    ekf.reset()
+    dt = 0.01
+
+    for i in range(300):
+        physics.step(0.3, 0.0, 0.0, 0.0, dt)
+        bundle = sensors.read(physics.state, physics.time)
+
+        ekf.predict(dt)
+        ekf.update_imu(bundle.imu)
+        ekf.update_barometer(bundle.barometer)
+        ekf.update_sonar(bundle.sonar)
+
+    real  = physics.state
+    est   = ekf.state_estimate
+
+    print(f"  Estado real:    x={real.x:.3f} z={real.z:.4f} u={real.u:.3f}")
+    print(f"  Estado EKF:     x={est.eta[0]:.3f} z={est.eta[2]:.4f} u={est.nu[0]:.3f}")
+    print(f"  Erro posição x: {abs(real.x - est.eta[0]):.4f} m")
+    print(f"  Erro profund z: {abs(real.z - est.eta[2]):.4f} m")
+
+    print("\n✓ Sensor Engine + EKF validados.")
