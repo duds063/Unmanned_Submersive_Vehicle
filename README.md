@@ -49,7 +49,8 @@ Inicie o servidor de visualização:
 ```bash
 python visualization_server.py
 ```
-Metodologia Científica
+## Metodologia Científica
+
 O projeto foi construído sobre uma esteira de pesquisa iniciada no ICS (Inertial Control Sandbox), focando na transição de sistemas inerciais simples para dinâmicas navais complexas. O uso de Domain Randomization durante o treino da IA garante que o controlador seja resiliente a variações de densidade da água e ruído eletromagnético nos sensores.
 
 Desenvolvido por Eduardo Souza Costa e Marcelo Henrique Valdiero.
