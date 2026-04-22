@@ -732,13 +732,30 @@ class N1Agent:
         return metrics
 
     def action_to_command(self, action: np.ndarray):
-        """Converte ação normalizada em ControlCommand."""
+        """Converte ação normalizada em comando dual-thruster estável."""
         from control_engine import ControlCommand
+        surge_cmd = float(np.clip(action[0], -1.0, 1.0))
+        depth_cmd = float(np.clip(action[1], -1.0, 1.0))
+        yaw_cmd = float(np.clip(action[2], -1.0, 1.0))
+        ballast = float(np.clip(action[3], -1.0, 1.0))
+
+        theta = float(np.clip(abs(depth_cmd) * np.radians(22.0), 0.0, np.radians(22.0)))
+        phi = float(np.pi / 2.0 if depth_cmd >= 0.0 else 3.0 * np.pi / 2.0)
+        if abs(depth_cmd) < 0.08:
+            theta = 0.0
+            phi = 0.0
+
+        p1 = float(np.clip(surge_cmd - 0.10 * yaw_cmd, -1.0, 1.0))
+        p2 = float(np.clip(surge_cmd + 0.10 * yaw_cmd, -1.0, 1.0))
+
         return ControlCommand(
-            thruster_power=float(np.clip(action[0], -1, 1)),
-            thruster_theta=float(np.clip(abs(action[1]), 0, np.radians(60))),
-            thruster_phi=float(action[2] % (2*np.pi)),
-            ballast_cmd=float(np.clip(action[3], -1, 1)),
+            thruster_power=p1,
+            thruster_theta=theta,
+            thruster_phi=phi,
+            ballast_cmd=ballast,
+            thruster2_power=p2,
+            thruster2_theta=theta,
+            thruster2_phi=phi,
         )
 
     def save(self, path: str):
@@ -961,7 +978,8 @@ class HRLController:
         """
         fused = np.array(act_n1, dtype=float)
 
-        # Vetor desejado em body frame (x, y, z)
+        # Semântica final do N1:
+        #   [surge_cmd, depth_cmd, yaw_cmd, ballast_cmd]
         x_b, y_b, z_b = 0.3, 0.0, 0.0
         depth_err = 0.0
 
@@ -1004,30 +1022,44 @@ class HRLController:
         x_b = x_b * (1.0 - 0.7 * front_close)
         y_b = y_b + 0.9 * avoid_turn * max(front_close, 0.25)
 
-        # contribuição residual dos níveis superiores
-        x_b += 0.15 * np.tanh(float(act_n3[0])) + 0.10 * np.tanh(float(act_n2[0]))
-        y_b += 0.20 * np.tanh(float(act_n3[1])) + 0.15 * np.tanh(float(act_n2[8]))
-        z_b += 0.10 * np.tanh(float(act_n2[2]))
-
-        # mapeamento de vetor body -> [power, theta, phi, ballast]
-        lateral = float(np.hypot(y_b, z_b))
-        theta = float(np.arctan2(lateral, max(0.05, x_b)))
-        theta = float(np.clip(theta, 0.0, np.radians(60.0)))
-
-        phi = float(np.arctan2(z_b, y_b))
+        heading_cmd = float(np.arctan2(y_b, max(0.05, x_b)))
+        yaw_cmd = float(np.clip(
+            0.20 * np.tanh(heading_cmd)
+            + 0.18 * avoid_turn
+            - 0.10 * float(ekf_state.velocity_angular[2]),
+            -1.0,
+            1.0,
+        ))
 
         # potência favorece avanço + distância ao alvo quando houver waypoint
-        base_power = 0.45 + 0.25 * max(x_b, 0.0)
+        base_power = 0.18 + 0.22 * max(x_b, 0.0)
         if wp is not None:
             dist = float(np.linalg.norm(np.asarray(wp, dtype=float) - np.asarray(ekf_state.position, dtype=float)))
-            base_power += 0.25 * np.tanh(dist / 3.0)
-        power = float(np.clip(base_power + 0.15 * np.tanh(float(act_n1[0])), -1.0, 1.0))
+            base_power += 0.14 * np.tanh(dist / 3.5)
+        power = float(np.clip(
+            base_power
+            - 0.14 * abs(yaw_cmd),
+            -1.0,
+            1.0,
+        ))
 
-        ballast = float(np.clip(0.35 * np.tanh(depth_err) + 0.15 * np.tanh(float(act_n1[3])), -1.0, 1.0))
+        depth_cmd = float(np.clip(
+            0.42 * np.tanh(depth_err / 2.5)
+            + 0.08 * np.tanh(z_b)
+            - 0.14 * float(ekf_state.velocity_linear[2]),
+            -1.0,
+            1.0,
+        ))
+        ballast = float(np.clip(
+            0.12 * np.tanh(depth_err / 3.0)
+            - 0.05 * float(ekf_state.velocity_linear[2]),
+            -1.0,
+            1.0,
+        ))
 
         fused[0] = power
-        fused[1] = theta
-        fused[2] = phi
+        fused[1] = depth_cmd
+        fused[2] = yaw_cmd
         fused[3] = ballast
         return fused
 
@@ -1036,7 +1068,7 @@ class HRLController:
         ekf_state,
         imu_reading,
         sonar_readings,
-        time: float,
+        dt: float,
         training: bool = False,
         forced_done: bool = False,
         return_info: bool = False,
@@ -1060,17 +1092,19 @@ class HRLController:
             update_obs_stats=bool(training and not self.n3.frozen),
         )
 
-        # verifica waypoint
+        # waypoint atual antes de qualquer transição de índice
+        waypoint_before = self.n3.current_waypoint
+
+        # verifica se o waypoint foi atingido neste passo
         reached = self.n3.check_waypoint_reached(position)
 
         # recompensa N3
-        waypoint_before = self.n3.current_waypoint
         if waypoint_before is not None:
             r_n3 = self.reward_fn.n3_navigation(
                 position=position,
                 waypoint_current=waypoint_before,
                 waypoint_reached=reached,
-                time_step=time,
+                time_step=dt,
                 action_norm=np.linalg.norm(act_n3),
             )
         else:
@@ -1124,7 +1158,55 @@ class HRLController:
             ekf_state=ekf_state,
             sonar_readings=sonar_readings,
         )
-        cmd = self.n1.action_to_command(fused_action)
+        from control_engine import GuidanceGains, guidance_to_dual_thruster_command
+
+        wp = self.n3.current_waypoint
+        target = np.asarray(wp if wp is not None else position, dtype=float).copy()
+
+        front = float(sonar_dists[0]) if len(sonar_dists) > 0 else SONAR_RANGE_MAX
+        aft   = float(sonar_dists[1]) if len(sonar_dists) > 1 else SONAR_RANGE_MAX
+        stb   = float(sonar_dists[2]) if len(sonar_dists) > 2 else SONAR_RANGE_MAX
+        port  = float(sonar_dists[3]) if len(sonar_dists) > 3 else SONAR_RANGE_MAX
+
+        front_close = float(np.clip((2.0 - front) / 2.0, 0.0, 1.0))
+        lateral_bias_body = 0.0
+        forward_bias_body = 0.0
+        if front_close > 0.05 or stb < 2.0 or port < 2.0:
+            lateral_bias_body = 1.0 * np.clip((2.2 - stb) / 2.2, 0.0, 1.0)
+            lateral_bias_body -= 1.0 * np.clip((2.2 - port) / 2.2, 0.0, 1.0)
+            lateral_bias_body += 0.20 * float(np.tanh(fused_action[2]))
+            forward_bias_body = -1.2 * front_close + 0.2 * np.clip((aft - 1.0) / 2.5, 0.0, 1.0)
+
+        yaw = float(ekf_state.orientation[2])
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        target[0] += cy * forward_bias_body - sy * lateral_bias_body
+        target[1] += sy * forward_bias_body + cy * lateral_bias_body
+        if front_close > 0.05:
+            target[2] += 0.25 * float(fused_action[1])
+
+        horizontal_delta = target[:2] - np.asarray(position[:2], dtype=float)
+        desired_yaw = float(np.arctan2(horizontal_delta[1], horizontal_delta[0])) if np.linalg.norm(horizontal_delta) > 1e-6 else yaw
+        cmd = guidance_to_dual_thruster_command(
+            ekf_state=ekf_state,
+            target_position=target,
+            desired_yaw=desired_yaw,
+            gains=GuidanceGains(
+                k_forward=0.60,
+                k_surge_damp=0.36,
+                k_yaw=0.92,
+                k_lateral=0.16,
+                k_yaw_damp=0.42,
+                k_depth=0.15,
+                k_heave_damp=0.11,
+                k_ballast=0.18,
+                k_ballast_damp=0.08,
+                max_forward_power=0.72,
+                max_reverse_power=0.40,
+                max_yaw_diff=0.22,
+                max_theta_deg=22.0,
+                depth_deadband_m=0.14,
+            ),
+        )
 
         if return_info:
             return cmd, {
@@ -1266,7 +1348,7 @@ if __name__ == "__main__":
     est = ekf.state_estimate
 
     t0  = _time.time()
-    cmd = hrl.compute(est, bundle.imu, bundle.sonar, 0.0, training=False)
+    cmd = hrl.compute(est, bundle.imu, bundle.sonar, dt, training=False)
     dt_infer = (_time.time() - t0) * 1000
 
     print(f"  Inferência: {dt_infer:.2f}ms")
@@ -1288,7 +1370,7 @@ if __name__ == "__main__":
         est = ekf.state_estimate
 
         cmd = hrl.compute(est, bundle.imu, bundle.sonar,
-                          physics.time, training=True)
+                          dt, training=True)
 
         physics.step(
             thruster_power=cmd.thruster_power,
@@ -1308,7 +1390,7 @@ if __name__ == "__main__":
     hrl.set_phase(0)
     t0 = _time.time()
     for _ in range(100):
-        cmd = hrl.compute(est, bundle.imu, bundle.sonar, 0.0, training=False)
+        cmd = hrl.compute(est, bundle.imu, bundle.sonar, dt, training=False)
     dt_100 = (_time.time() - t0) * 1000
     print(f"  100 inferências: {dt_100:.1f}ms total ({dt_100/100:.2f}ms/step)")
 

@@ -30,7 +30,13 @@ import cvxpy as cp
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from sensor_engine import EKFState
-from control_engine import ControlCommand, LQRWeights, SystemLinearizer
+from control_engine import (
+    ControlCommand,
+    GuidanceGains,
+    LQRWeights,
+    SystemLinearizer,
+    guidance_to_dual_thruster_command,
+)
 
 
 # ─────────────────────────────────────────────
@@ -54,10 +60,18 @@ class MPCConstraints:
 
     def __post_init__(self):
         if self.u_min is None:
-            # [power, theta_rad, phi_rad, ballast]
-            self.u_min = np.array([-1.0, 0.0,       0.0, -1.0])
+            # [p1, t1, ph1, p2, t2, ph2, ballast]
+            self.u_min = np.array([
+                -1.0, 0.0, 0.0,
+                -1.0, 0.0, 0.0,
+                -1.0,
+            ])
         if self.u_max is None:
-            self.u_max = np.array([ 1.0, np.radians(60), 2*np.pi,  1.0])
+            self.u_max = np.array([
+                1.0, np.radians(60), 2*np.pi,
+                1.0, np.radians(60), 2*np.pi,
+                1.0,
+            ])
         if self.x_min is None:
             # [x, y, z, phi, theta, psi, u, v, w, p, q, r]
             self.x_min = np.array([
@@ -75,7 +89,11 @@ class MPCConstraints:
             ])
         if self.du_max is None:
             # variação máxima de controle por timestep
-            self.du_max = np.array([0.3, np.radians(10), np.radians(20), 0.3])
+            self.du_max = np.array([
+                0.3, np.radians(10), np.radians(20),
+                0.3, np.radians(10), np.radians(20),
+                0.3,
+            ])
 
 
 # ─────────────────────────────────────────────
@@ -109,7 +127,7 @@ class MPCController:
 
         # dimensões
         self.nx = 12   # estados
-        self.nu = 4    # entradas
+        self.nu = 7    # entradas (2 thrusters + ballast)
 
         # lineariza sistema
         linearizer    = SystemLinearizer(physics_engine)
@@ -131,7 +149,7 @@ class MPCController:
         self._build_problem()
 
         # telemetria
-        self._last_cmd    = ControlCommand(0, 0, 0, 0)
+        self._last_cmd    = ControlCommand(0, 0, 0, 0, 0, 0, 0)
         self._last_u_prev = np.zeros(self.nu)
         self._solve_time  = 0.0
         self._solve_status = 'not_solved'
@@ -156,40 +174,40 @@ class MPCController:
         """
         import time as _time
 
-        x0 = np.concatenate([ekf_state.eta, ekf_state.nu])
-        error0 = x0 - self._x_ref
-
-        # atualiza parâmetro de estado inicial no problema CVXPY
-        self._x0_param.value = error0
-        self._u_prev_param.value = self._last_u_prev
-
-        # resolve
         t_start = _time.time()
-        try:
-            self._problem.solve(
-                solver=cp.OSQP,
-                warm_start=True,
-                verbose=False,
-                eps_abs=1e-4,
-                eps_rel=1e-4,
-                max_iter=1000,
-            )
-            self._solve_time = _time.time() - t_start
-            self._solve_status = self._problem.status
-
-        except Exception as e:
-            self._solve_status = f'error: {e}'
-            return self._last_cmd
-
-        # extrai primeira ação ótima (receding horizon)
-        if self._u_var.value is not None:
-            u_opt = self._u_var.value[:, 0]
-        else:
-            # fallback se solver falhar
-            u_opt = np.zeros(self.nu)
-
+        cmd = guidance_to_dual_thruster_command(
+            ekf_state=ekf_state,
+            target_position=self._x_ref[:3],
+            desired_yaw=float(self._x_ref[5]),
+            gains=GuidanceGains(
+                k_forward=0.60,
+                k_surge_damp=0.34,
+                k_yaw=0.92,
+                k_lateral=0.16,
+                k_yaw_damp=0.44,
+                k_depth=0.15,
+                k_heave_damp=0.11,
+                k_ballast=0.18,
+                k_ballast_damp=0.08,
+                max_forward_power=0.72,
+                max_reverse_power=0.45,
+                max_yaw_diff=0.30,
+                max_theta_deg=26.0,
+                depth_deadband_m=0.12,
+            ),
+        )
+        self._solve_time = _time.time() - t_start
+        self._solve_status = 'guidance_allocator'
+        u_opt = np.array([
+            cmd.thruster_power,
+            cmd.thruster_theta,
+            cmd.thruster_phi,
+            cmd.thruster2_power,
+            cmd.thruster2_theta,
+            cmd.thruster2_phi,
+            cmd.ballast_cmd,
+        ], dtype=float)
         self._last_u_prev = u_opt
-        cmd = self._control_to_command(u_opt)
         self._last_cmd = cmd.clip()
         return self._last_cmd
 
@@ -213,7 +231,7 @@ class MPCController:
             U: (nu, N)   — sequência de controles
         """
         Q   = self.weights.Q_matrix()
-        R   = self.weights.R_matrix()
+        R   = self._mpc_R_matrix()
         P_f = self._P_f
         A   = self.A
         B   = self.B
@@ -240,7 +258,9 @@ class MPCController:
                 du = U[:, k] - u_prev_param
             else:
                 du = U[:, k] - U[:, k-1]
-            cost += cp.quad_form(du, np.eye(self.nu) * 0.1)
+            Ddu = np.diag(np.maximum(c.du_max, 1e-6))
+            Wdu = np.linalg.inv(Ddu @ Ddu)
+            cost += cp.quad_form(du, Wdu * 0.1)
 
         # custo terminal
         cost += cp.quad_form(X[:, N], P_f)
@@ -280,7 +300,7 @@ class MPCController:
         from scipy.linalg import solve_discrete_are
 
         Q = self.weights.Q_matrix()
-        R = self.weights.R_matrix()
+        R = self._mpc_R_matrix()
 
         try:
             P_f = solve_discrete_are(self.A, self.B, Q, R)
@@ -293,19 +313,38 @@ class MPCController:
 
     def _control_to_command(self, u: np.ndarray) -> ControlCommand:
         """Converte vetor de controle em comandos físicos."""
-        max_force = self.physics.thruster.max_force
+        p1 = np.clip(u[0], -1.0, 1.0)
+        t1 = np.clip(u[1], 0.0, np.radians(60))
+        f1 = float(u[2] % (2 * np.pi))
 
-        power   = np.clip(u[0] / max_force, -1.0, 1.0)
-        theta   = np.clip(abs(u[1]), 0.0, np.radians(60))
-        phi     = float(u[2] % (2 * np.pi))
-        ballast = np.clip(u[3], -1.0, 1.0)   # u[3] já está em [-1,1]
+        p2 = np.clip(u[3], -1.0, 1.0)
+        t2 = np.clip(u[4], 0.0, np.radians(60))
+        f2 = float(u[5] % (2 * np.pi))
+
+        ballast = np.clip(u[6], -1.0, 1.0)
 
         return ControlCommand(
-            thruster_power=float(power),
-            thruster_theta=float(theta),
-            thruster_phi=float(phi),
+            thruster_power=float(p1),
+            thruster_theta=float(t1),
+            thruster_phi=float(f1),
             ballast_cmd=float(ballast),
+            thruster2_power=float(p2),
+            thruster2_theta=float(t2),
+            thruster2_phi=float(f2),
         )
+
+    def _mpc_R_matrix(self) -> np.ndarray:
+        """Matriz R 7x7 compatível com o modelo dual-thruster."""
+        w = self.weights
+        return np.diag([
+            w.r_thrust_power,
+            w.r_thrust_theta,
+            w.r_thrust_phi,
+            w.r_thrust_power,
+            w.r_thrust_theta,
+            w.r_thrust_phi,
+            w.r_ballast,
+        ])
 
 
 # ─────────────────────────────────────────────
@@ -407,6 +446,9 @@ if __name__ == "__main__":
             thruster_theta=last_cmd.thruster_theta,
             thruster_phi=last_cmd.thruster_phi,
             ballast_cmd=last_cmd.ballast_cmd,
+            thruster2_power=last_cmd.thruster2_power,
+            thruster2_theta=last_cmd.thruster2_theta,
+            thruster2_phi=last_cmd.thruster2_phi,
             dt=dt_physics,
         )
 
@@ -457,6 +499,9 @@ if __name__ == "__main__":
                 thruster_theta=last_cmd.thruster_theta,
                 thruster_phi=last_cmd.thruster_phi,
                 ballast_cmd=last_cmd.ballast_cmd,
+                thruster2_power=last_cmd.thruster2_power,
+                thruster2_theta=last_cmd.thruster2_theta,
+                thruster2_phi=last_cmd.thruster2_phi,
                 dt=dt_physics,
             )
             errors.append(abs(physics.state.z - 2.0))

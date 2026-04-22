@@ -556,7 +556,7 @@ class MissionEngine:
                 ekf_state=est,
                 imu_reading=bundle.imu,
                 sonar_readings=bundle.sonar,
-                time=self.physics.time,
+                dt=dt,
                 training=training,
             )
 
@@ -566,6 +566,9 @@ class MissionEngine:
                 thruster_theta=cmd.thruster_theta,
                 thruster_phi=cmd.thruster_phi,
                 ballast_cmd=cmd.ballast_cmd,
+                thruster2_power=cmd.thruster2_power,
+                thruster2_theta=cmd.thruster2_theta,
+                thruster2_phi=cmd.thruster2_phi,
                 dt=dt,
             )
 

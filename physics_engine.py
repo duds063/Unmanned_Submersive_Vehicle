@@ -46,7 +46,7 @@ class ComponentMasses:
     electronics:    float = 0.050   # kg — VL53L0X + PCBs + cabos
     thruster_motor: float = 0.200   # kg — motor brushless + propulsor
     structure:      float = 0.100   # kg — suportes internos + vedações
-    ballast_fixed:  float = 0.870   # kg — lastro fixo (reduzido para ponto neutro no meio do range)
+    ballast_fixed:  float = 0.870   # kg — lastro fixo de chumbo para ponto neutro
 
     @property
     def total(self) -> float:
@@ -143,7 +143,7 @@ class Thruster:
     Força máxima parametrizável.
     """
     max_force:      float           # N — força máxima
-    arm_length:     float = 0.0     # m — braço de momento em relação ao CG
+    position_body:  np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))
 
     # estado — ângulos em radianos
     _theta: float = field(init=False, default=0.0)  # ângulo polar (0 = eixo x)
@@ -194,10 +194,8 @@ class Thruster:
         Torque gerado pelo propulsor em torno do CG.
         τ = r × F, onde r é o vetor da popa ao CG.
         """
-        # O thrust foi modelado para passar pelo CG, então o braço de momento
-        # é nulo por padrão. Mantemos o vetor parametrizado para permitir
-        # futuras variações de layout sem reescrever a física.
-        r = np.array([-self.arm_length, 0.0, 0.0])
+        # Torque pelo braço do ponto de aplicação em relação ao CG.
+        r = np.asarray(self.position_body, dtype=float)
         F = self.thrust_vector_body
         return np.cross(r, F)
 
@@ -299,9 +297,16 @@ class PhysicsEngine:
             base_mass=self.hull.mass_hull + self.components.total,
             sim_speed_multiplier=sim_speed_multiplier,
         )
-        self.thruster   = Thruster(
+        # Dois thrusters laterais na altura do CG para recuperar autoridade
+        # de roll/yaw sem deslocar longitudinalmente o thrust do centro de massa.
+        lateral_arm = max(0.03, 0.4 * self.hull.R)
+        self.thruster_port = Thruster(
             max_force=max_thruster_force,
-            arm_length=0.0
+            position_body=np.array([0.0, +lateral_arm, 0.0], dtype=float),
+        )
+        self.thruster_starboard = Thruster(
+            max_force=max_thruster_force,
+            position_body=np.array([0.0, -lateral_arm, 0.0], dtype=float),
         )
 
         self._state = VehicleState()
@@ -333,24 +338,45 @@ class PhysicsEngine:
         thruster_theta: float,
         thruster_phi:   float,
         ballast_cmd:    float,
+        thruster2_power: Optional[float] = None,
+        thruster2_theta: Optional[float] = None,
+        thruster2_phi:   Optional[float] = None,
         dt:             float = 0.01,
     ) -> VehicleState:
         """
         Avança a simulação por um timestep dt.
 
         Args:
-            thruster_power: [-1, 1]
-            thruster_theta: ângulo polar do propulsor [0, 60°] em rad
-            thruster_phi:   ângulo azimutal [0, 2π] em rad
+            thruster_power: [-1, 1] thruster 1 (ou potência total quando thruster2_* = None)
+            thruster_theta: ângulo polar do thruster 1 [0, 60°] em rad
+            thruster_phi:   ângulo azimutal do thruster 1 [0, 2π] em rad
             ballast_cmd:    [-1, 1] — -1 expele, +1 injeta água
+            thruster2_power/theta/phi: comandos do thruster 2 (opcional)
             dt:             timestep em segundos
 
         Returns:
             Novo estado do veículo
         """
-        # atualiza atuadores
-        self.thruster.set_orientation(thruster_theta, thruster_phi)
-        self.thruster.set_power(thruster_power)
+        # Atualiza atuadores.
+        # Compatibilidade: sem comandos do thruster 2, divide o comando total
+        # igualmente entre os dois thrusters para manter força equivalente ao
+        # modelo antigo de thruster único.
+        if thruster2_power is None and thruster2_theta is None and thruster2_phi is None:
+            p1 = p2 = 0.5 * float(thruster_power)
+            t1 = t2 = float(thruster_theta)
+            f1 = f2 = float(thruster_phi)
+        else:
+            p1 = float(thruster_power)
+            t1 = float(thruster_theta)
+            f1 = float(thruster_phi)
+            p2 = float(thruster2_power if thruster2_power is not None else thruster_power)
+            t2 = float(thruster2_theta if thruster2_theta is not None else thruster_theta)
+            f2 = float(thruster2_phi if thruster2_phi is not None else thruster_phi)
+
+        self.thruster_port.set_orientation(t1, f1)
+        self.thruster_port.set_power(p1)
+        self.thruster_starboard.set_orientation(t2, f2)
+        self.thruster_starboard.set_power(p2)
         self.ballast.update(ballast_cmd, dt)
 
         # recalcula massa adicionada com lastro atualizado
@@ -381,12 +407,10 @@ class PhysicsEngine:
         R   = self.hull.R
         c   = self.coeff
 
-        # momentos de inércia de casca cilíndrica oca (mais realista que sólido)
-        # Para casca: Ixx = m*R^2, Iyy ≈ m*(R^2/2 + L^2/12)
-        # Fator 0.7 em Ixx por distribuição não-uniforme de massa (componentes internos)
-        Ixx = 0.7  * m * R**2                          # roll — casca
-        Iyy = m * (0.5 * R**2 + L**2 / 12.0)          # pitch — casca
-        Izz = Iyy                                       # yaw — simetria axial
+        # momentos de inércia do casco aproximado como casca cilíndrica
+        Ixx = 0.7  * m * R**2                          # roll
+        Iyy = (1/12) * m * (3*R**2 + L**2)            # pitch
+        Izz = Iyy                                       # yaw — simetria
 
         M_rigid = np.diag([m, m, m, Ixx, Iyy, Izz])
         M_added = np.diag([
@@ -526,7 +550,7 @@ class PhysicsEngine:
         C   = self._coriolis_matrix(nu)
         D   = self._drag_matrix(nu)
         g   = self._restoring_forces(eta)
-        tau = self.thruster.wrench_body  # forças e torques do propulsor
+        tau = self.thruster_port.wrench_body + self.thruster_starboard.wrench_body
 
         eta_dot = J @ nu
         nu_dot  = self._M_inv @ (tau - C @ nu - D @ nu - g)
@@ -582,6 +606,20 @@ class PhysicsEngine:
 
     def to_dict(self) -> dict:
         """Serializa estado completo pra JSON — WebSocket."""
+        F_port = self.thruster_port.thrust_vector_body
+        F_stbd = self.thruster_starboard.thrust_vector_body
+        F_total = F_port + F_stbd
+        F_norm = float(np.linalg.norm(F_total))
+
+        if F_norm > 1e-9:
+            theta_total = float(np.arctan2(np.linalg.norm(F_total[1:]), F_total[0]))
+            phi_total = float(np.arctan2(F_total[2], F_total[1]))
+        else:
+            theta_total = 0.0
+            phi_total = 0.0
+
+        avg_power = 0.5 * (self.thruster_port._power + self.thruster_starboard._power)
+
         return {
             'time':     self._time,
             'state':    self._state.to_dict(),
@@ -592,10 +630,24 @@ class PhysicsEngine:
                 'density_avg':  self.total_mass / self.hull.volume,
             },
             'thruster': {
-                'power':        self.thruster._power,
-                'theta_deg':    np.degrees(self.thruster._theta),
-                'phi_deg':      np.degrees(self.thruster._phi),
-                'force_vector': self.thruster.thrust_vector_body.tolist(),
+                'power':        avg_power,
+                'theta_deg':    np.degrees(theta_total),
+                'phi_deg':      np.degrees(phi_total),
+                'force_vector': F_total.tolist(),
+            },
+            'thruster_pair': {
+                'port': {
+                    'power': self.thruster_port._power,
+                    'theta_deg': np.degrees(self.thruster_port._theta),
+                    'phi_deg': np.degrees(self.thruster_port._phi),
+                    'force_vector': F_port.tolist(),
+                },
+                'starboard': {
+                    'power': self.thruster_starboard._power,
+                    'theta_deg': np.degrees(self.thruster_starboard._theta),
+                    'phi_deg': np.degrees(self.thruster_starboard._phi),
+                    'force_vector': F_stbd.tolist(),
+                },
             },
         }
 

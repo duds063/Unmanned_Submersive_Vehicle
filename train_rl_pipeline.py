@@ -182,7 +182,7 @@ def step_hierarchy(
         est,
         bundle.imu,
         bundle.sonar,
-        time_s,
+        dt,
         training=training,
         forced_done=done,
         return_info=True,
@@ -193,6 +193,9 @@ def step_hierarchy(
         thruster_theta=cmd.thruster_theta,
         thruster_phi=cmd.thruster_phi,
         ballast_cmd=cmd.ballast_cmd,
+        thruster2_power=cmd.thruster2_power,
+        thruster2_theta=cmd.thruster2_theta,
+        thruster2_phi=cmd.thruster2_phi,
         dt=dt,
     )
 
@@ -296,12 +299,15 @@ def evaluate(hrl: HRLController, physics: PhysicsEngine, sensors: SensorEngine, 
             min_distance_to_current_wp = min(min_distance_to_current_wp, dist)
 
         prev_idx = hrl.n3.current_wp_idx
-        cmd = hrl.compute(est, bundle.imu, bundle.sonar, physics.time, training=False)
+        cmd = hrl.compute(est, bundle.imu, bundle.sonar, config.dt, training=False)
         physics.step(
             thruster_power=cmd.thruster_power,
             thruster_theta=cmd.thruster_theta,
             thruster_phi=cmd.thruster_phi,
             ballast_cmd=cmd.ballast_cmd,
+            thruster2_power=cmd.thruster2_power,
+            thruster2_theta=cmd.thruster2_theta,
+            thruster2_phi=cmd.thruster2_phi,
             dt=config.dt,
         )
 

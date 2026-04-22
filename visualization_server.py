@@ -14,9 +14,11 @@ import numpy as np
 import threading
 import time
 import json
+import os
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
+from benchmark_engine import BenchmarkScenario, ControllerBenchmark
 from geometry_engine import GeometryEngine
 from physics_engine  import PhysicsEngine, VehicleState
 from sensor_engine   import SensorEngine, ExtendedKalmanFilter, Environment
@@ -49,6 +51,10 @@ SIM = {
     'rayleigh_sigma': 0.03,
     'env_disturbance_scale': 0.0,
     'mode':        'free',  # free | training | inference
+    'benchmark_running': False,
+    'benchmark_result': None,
+    'benchmark_status': 'idle',
+    'benchmark_history': [],
 }
 
 # componentes — inicializados no startup
@@ -60,10 +66,46 @@ ekf     = None
 control = None
 hrl     = None
 dynamic_obstacles = []
+benchmark_runner = ControllerBenchmark('./checkpoints')
+BENCHMARK_HISTORY_PATH = os.path.join(os.getcwd(), 'benchmark_history.json')
 
 # trajetória e lock
 traj_lock = threading.Lock()
 physics_lock = threading.Lock()   # protege physics + control de acesso concorrente GUI/sim
+
+
+def _load_benchmark_history():
+    if not os.path.exists(BENCHMARK_HISTORY_PATH):
+        return []
+    try:
+        with open(BENCHMARK_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_benchmark_history(history):
+    with open(BENCHMARK_HISTORY_PATH, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def _history_entry_from_result(result):
+    scenario = result.get('scenario', {})
+    ranking = result.get('ranking', [])
+    return {
+        'saved_at_epoch_s': time.time(),
+        'scenario': {
+            'trials': scenario.get('trials'),
+            'max_steps': scenario.get('max_steps'),
+            'dt': scenario.get('dt'),
+            'noise_scale': scenario.get('noise_scale'),
+            'rayleigh_enabled': scenario.get('rayleigh_enabled'),
+            'waypoints': scenario.get('waypoints', []),
+        },
+        'ranking': ranking,
+        'controllers': result.get('controllers', {}),
+    }
 
 
 # ─────────────────────────────────────────────
@@ -93,10 +135,11 @@ def init_simulation():
 
     integrate_mpc(control, hover_depth=5.0)
     hrl = integrate_rl(control, './checkpoints')
+    SIM['benchmark_history'] = _load_benchmark_history()
 
     # waypoint inicial
     SIM['waypoints'] = [[5.0, 0.0, 5.0]]
-    control.set_reference(np.array([5.0, 0.0, 5.0]))
+    control.set_waypoints([np.array([5.0, 0.0, 5.0], dtype=float)])
 
     print("✓ Simulação inicializada")
 
@@ -147,7 +190,7 @@ def simulation_loop():
             elif ctrl == 'rl':
                 cmd = hrl.compute(
                     est, bundle.imu, bundle.sonar,
-                    SIM['time'], training=False
+                  dt, training=False
                 )
             else:
                 from control_engine import ControlCommand
@@ -158,6 +201,9 @@ def simulation_loop():
                 thruster_theta=cmd.thruster_theta,
                 thruster_phi=cmd.thruster_phi,
                 ballast_cmd=cmd.ballast_cmd,
+              thruster2_power=cmd.thruster2_power,
+              thruster2_theta=cmd.thruster2_theta,
+              thruster2_phi=cmd.thruster2_phi,
                 dt=dt,
             )
 
@@ -230,10 +276,71 @@ def _emit_state(bundle, est, cmd):
         },
         'dynamic_obstacles': dyn_obs_data,
         'controller':        SIM['controller'],
+        'controller_waypoint': None if control.current_waypoint is None else control.current_waypoint.tolist(),
+        'controller_waypoint_index': control.waypoint_index,
+        'controller_waypoint_count': control.waypoint_count,
+        'controller_mission_complete': control.mission_complete,
         'command': cmd.to_dict(),
     }
 
     socketio.emit('state', state_data)
+
+
+def _build_benchmark_scenario(config=None):
+    """Captura o cenário atual da GUI para benchmark reproduzível."""
+    config = config or {}
+    with physics_lock:
+        waypoints = SIM['waypoints'][:] if SIM['waypoints'] else [[5.0, 0.0, 5.0]]
+        dyn_obs = [
+            {
+                'position': dyn.position.tolist(),
+                'radius': dyn.radius,
+                'velocity': dyn.velocity.tolist(),
+                'speed_max': dyn.speed_max,
+                'bounds_min': dyn.bounds_min.tolist(),
+                'bounds_max': dyn.bounds_max.tolist(),
+            }
+            for dyn in dynamic_obstacles
+        ]
+        scenario = BenchmarkScenario(
+            waypoints=[[float(v) for v in wp] for wp in waypoints],
+            static_obstacles=[],
+            dynamic_obstacles=dyn_obs,
+            dt=float(config.get('dt', SIM['dt'])),
+            max_steps=int(config.get('max_steps', 2500)),
+            trials=int(config.get('trials', 3)),
+            pool_depth=10.0,
+            pool_radius=30.0,
+            noise_scale=float(config.get('noise_scale', sensors.noise_scale)),
+            rayleigh_enabled=bool(config.get('rayleigh_enabled', SIM['rayleigh_enabled'])),
+            rayleigh_sigma=float(config.get('rayleigh_sigma', SIM['rayleigh_sigma'])),
+            env_disturbance_scale=float(config.get('env_disturbance_scale', SIM['env_disturbance_scale'])),
+            seed=int(config.get('seed', 42)),
+        )
+    return scenario
+
+
+def _benchmark_worker(scenario, controllers):
+    try:
+        SIM['benchmark_status'] = 'running'
+        result = benchmark_runner.run(
+            scenario,
+            controllers=controllers,
+            progress_callback=lambda payload: socketio.emit('benchmark_progress', payload),
+        )
+        SIM['benchmark_result'] = result
+        history = SIM.get('benchmark_history', [])
+        history.append(_history_entry_from_result(result))
+        SIM['benchmark_history'] = history
+        _save_benchmark_history(history)
+        SIM['benchmark_status'] = 'completed'
+        socketio.emit('benchmark_complete', result)
+        socketio.emit('benchmark_history', {'history': SIM['benchmark_history']})
+    except Exception as exc:
+        SIM['benchmark_status'] = 'error'
+        socketio.emit('benchmark_error', {'message': str(exc)})
+    finally:
+        SIM['benchmark_running'] = False
 
 
 # ─────────────────────────────────────────────
@@ -244,6 +351,13 @@ def _emit_state(bundle, est, cmd):
 def on_connect():
     print(f"Cliente conectado")
     emit('ready', {'mesh': geo.to_dict()['mesh']})
+    emit('benchmark_status', {
+        'status': SIM['benchmark_status'],
+        'running': SIM['benchmark_running'],
+    })
+    if SIM['benchmark_result'] is not None:
+        emit('benchmark_complete', SIM['benchmark_result'])
+    emit('benchmark_history', {'history': SIM.get('benchmark_history', [])})
 
 
 @socketio.on('start')
@@ -282,9 +396,7 @@ def on_set_waypoint(data):
     """Recebe waypoint clicado na cena 3D."""
     wp = data.get('position', [5, 0, 5])
     SIM['waypoints'] = [wp]
-    control.set_reference(np.array(wp))
-    if SIM['controller'] == 'mpc':
-        control._mpc.set_reference(np.array(wp))
+    control.set_waypoints([np.array(wp, dtype=float)])
     hrl.set_waypoints([np.array(wp)])
     emit('status', {'waypoint_set': wp})
 
@@ -294,6 +406,7 @@ def on_add_waypoint(data):
     """Adiciona waypoint à sequência."""
     wp = data.get('position', [5, 0, 5])
     SIM['waypoints'].append(wp)
+    control.set_waypoints([np.array(w, dtype=float) for w in SIM['waypoints']])
     hrl.set_waypoints([np.array(w) for w in SIM['waypoints'][:5]])
     emit('status', {'waypoints': SIM['waypoints']})
 
@@ -320,10 +433,7 @@ def on_set_waypoints(data):
         return
 
     SIM['waypoints'] = parsed
-    first_wp = np.array(parsed[0], dtype=float)
-    control.set_reference(first_wp)
-    if SIM['controller'] == 'mpc':
-        control._mpc.set_reference(first_wp)
+    control.set_waypoints([np.array(w, dtype=float) for w in parsed])
     hrl.set_waypoints([np.array(w, dtype=float) for w in parsed])
 
     emit('status', {
@@ -386,6 +496,30 @@ def on_environmental_disturbance(data):
     'rayleigh_sigma': SIM['rayleigh_sigma'],
     'env_disturbance_scale': SIM['env_disturbance_scale'],
   })
+
+
+@socketio.on('run_benchmark')
+def on_run_benchmark(data):
+    if SIM['benchmark_running']:
+        emit('benchmark_error', {'message': 'Benchmark já está em execução.'})
+        return
+
+    config = data or {}
+    scenario = _build_benchmark_scenario(config)
+    controllers = config.get('controllers', ['lqr', 'mpc', 'rl'])
+    controllers = [c for c in controllers if c in ['lqr', 'mpc', 'rl']]
+    if not controllers:
+        emit('benchmark_error', {'message': 'Nenhum controlador válido selecionado.'})
+        return
+
+    SIM['benchmark_running'] = True
+    SIM['benchmark_status'] = 'queued'
+    emit('benchmark_status', {
+        'status': 'queued',
+        'running': True,
+        'scenario': scenario.waypoints,
+    }, broadcast=True)
+    socketio.start_background_task(_benchmark_worker, scenario, controllers)
 
 
 # ─────────────────────────────────────────────
@@ -572,6 +706,51 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     background: var(--accent);
     border-radius: 50%;
     cursor: pointer;
+  }
+
+  .mini-input {
+    width: 100%;
+    background: rgba(0, 20, 30, 0.7);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 8px;
+    border-radius: 2px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+
+  .benchmark-status {
+    font-size: 9px;
+    color: var(--dim);
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+
+  .benchmark-board {
+    display: grid;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .benchmark-card {
+    border: 1px solid var(--border);
+    background: rgba(0, 255, 200, 0.03);
+    padding: 8px;
+    border-radius: 2px;
+  }
+
+  .benchmark-card strong {
+    font-family: var(--font-hud);
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: var(--accent);
+  }
+
+  .benchmark-card .meta {
+    margin-top: 4px;
+    font-size: 9px;
+    color: var(--dim);
+    line-height: 1.45;
   }
 
   /* ── bottom bar ── */
@@ -836,6 +1015,28 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <button class="btn" onclick="wpMode()">Click to Set</button>
       <button class="btn danger-btn" onclick="clearWaypoints()">Clear</button>
     </div>
+
+    <div class="panel-title" style="margin-top:12px">Benchmark</div>
+    <div class="benchmark-status" id="benchmark-status">Pronto para comparar LQR, MPC e RL no cenário atual.</div>
+
+    <div class="slider-group">
+      <div class="slider-label"><span>Trials</span><span id="bench-trials-val">3</span></div>
+      <input type="range" min="1" max="10" value="3" id="bench-trials"
+             oninput="document.getElementById('bench-trials-val').textContent = this.value">
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-label"><span>Max Steps</span><span id="bench-steps-val">2500</span></div>
+      <input type="range" min="500" max="5000" step="250" value="2500" id="bench-steps"
+             oninput="document.getElementById('bench-steps-val').textContent = this.value">
+    </div>
+
+    <div class="btn-group">
+      <button class="btn" id="btn-benchmark" onclick="runBenchmark()">Run Benchmark</button>
+    </div>
+    <div class="benchmark-board" id="benchmark-results"></div>
+    <div class="benchmark-status" style="margin-top:10px">Histórico de benchmarks para comparação</div>
+    <div class="benchmark-board" id="benchmark-history"></div>
   </div>
 
   <!-- STATUS BAR -->
@@ -1151,6 +1352,8 @@ let meshParams = null;
 let lastState  = null;
 let frameCount = 0, lastFpsTime = performance.now();
 let wpPlacementMode = false, obsPlacementMode = false;
+let benchmarkData = null;
+let benchmarkHistory = [];
 
 socket.on('connect', () => {
   document.getElementById('conn-dot').classList.remove('offline');
@@ -1185,6 +1388,99 @@ socket.on('status', data => {
     document.getElementById('obs-count').textContent = data.obstacles;
   }
 });
+
+socket.on('benchmark_status', data => {
+  const running = !!data.running;
+  document.getElementById('benchmark-status').textContent =
+    running ? 'Benchmark na fila...' : 'Benchmark pronto para execução.';
+  document.getElementById('btn-benchmark').disabled = running;
+});
+
+socket.on('benchmark_progress', data => {
+  const pct = Math.round((data.progress || 0) * 100);
+  document.getElementById('benchmark-status').textContent =
+    `Executando ${data.controller.toUpperCase()} | rodada ${data.trial}/${data.trials} | ${pct}%`;
+  document.getElementById('btn-benchmark').disabled = true;
+});
+
+socket.on('benchmark_complete', data => {
+  benchmarkData = data;
+  document.getElementById('benchmark-status').textContent =
+    `Benchmark concluído com ${data.scenario.trials} rodada(s).`;
+  document.getElementById('btn-benchmark').disabled = false;
+  renderBenchmark(data);
+});
+
+socket.on('benchmark_history', data => {
+  benchmarkHistory = Array.isArray(data.history) ? data.history : [];
+  renderBenchmarkHistory(benchmarkHistory);
+});
+
+socket.on('benchmark_error', data => {
+  document.getElementById('benchmark-status').textContent =
+    `Erro no benchmark: ${data.message}`;
+  document.getElementById('btn-benchmark').disabled = false;
+});
+
+function runBenchmark() {
+  document.getElementById('benchmark-status').textContent = 'Preparando benchmark...';
+  document.getElementById('btn-benchmark').disabled = true;
+  socket.emit('run_benchmark', {
+    trials: Number(document.getElementById('bench-trials').value),
+    max_steps: Number(document.getElementById('bench-steps').value),
+  });
+}
+
+function renderBenchmark(data) {
+  const root = document.getElementById('benchmark-results');
+  const ranking = data.ranking || [];
+  if (!ranking.length) {
+    root.innerHTML = '<div class="benchmark-card"><div class="meta">Sem dados de benchmark.</div></div>';
+    return;
+  }
+
+  root.innerHTML = ranking.map((item, index) => `
+    <div class="benchmark-card">
+      <strong>#${index + 1} ${item.controller.toUpperCase()}</strong>
+      <div class="meta">
+        score ${item.score.toFixed(1)} | sucesso ${(item.success_rate * 100).toFixed(0)}% | colisão ${(item.collision_rate * 100).toFixed(0)}%<br>
+        erro médio ${item.mean_tracking_error_m.toFixed(2)} m | erro final ${item.mean_final_error_m.toFixed(2)} m<br>
+        tempo ${item.mean_time_s.toFixed(1)} s | energia ${item.mean_energy_score.toFixed(2)} | CPU ${item.mean_compute_ms.toFixed(2)} ms
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderBenchmarkHistory(history) {
+  const root = document.getElementById('benchmark-history');
+  if (!history.length) {
+    root.innerHTML = '<div class="benchmark-card"><div class="meta">Sem histórico salvo ainda.</div></div>';
+    return;
+  }
+
+  const items = history.slice().reverse();
+  root.innerHTML = items.map((entry, idx) => {
+    const when = new Date((entry.saved_at_epoch_s || 0) * 1000);
+    const whenText = Number.isNaN(when.getTime()) ? 'sem data' : when.toLocaleString();
+    const scenario = entry.scenario || {};
+    const label = entry.label ? String(entry.label) : null;
+    const ranking = Array.isArray(entry.ranking) ? entry.ranking : [];
+    const summary = ranking.map(item =>
+      `${item.controller.toUpperCase()}: score ${item.score.toFixed(1)}, sucesso ${(item.success_rate * 100).toFixed(0)}%, colisão ${(item.collision_rate * 100).toFixed(0)}%`
+    ).join('<br>');
+    return `
+      <div class="benchmark-card">
+        <strong>${label ? label.toUpperCase() : `LOG #${history.length - idx}`}</strong>
+        <div class="meta">
+          ${whenText}<br>
+          trials ${scenario.trials ?? '—'} | max_steps ${scenario.max_steps ?? '—'} | dt ${scenario.dt ?? '—'}<br>
+          waypoints ${Array.isArray(scenario.waypoints) ? scenario.waypoints.length : 0}<br>
+          ${summary || 'Sem ranking salvo.'}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
 
 // ─── Atualização da cena ──────────────────────────────────────
 function updateScene(data) {
