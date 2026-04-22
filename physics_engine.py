@@ -46,7 +46,7 @@ class ComponentMasses:
     electronics:    float = 0.050   # kg — VL53L0X + PCBs + cabos
     thruster_motor: float = 0.200   # kg — motor brushless + propulsor
     structure:      float = 0.100   # kg — suportes internos + vedações
-    ballast_fixed:  float = 0.970   # kg — lastro fixo de chumbo para ponto neutro
+    ballast_fixed:  float = 0.870   # kg — lastro fixo (reduzido para ponto neutro no meio do range)
 
     @property
     def total(self) -> float:
@@ -381,10 +381,12 @@ class PhysicsEngine:
         R   = self.hull.R
         c   = self.coeff
 
-        # momentos de inércia do cilindro sólido
-        Ixx = 0.5  * m * R**2                          # roll
-        Iyy = (1/12) * m * (3*R**2 + L**2)            # pitch
-        Izz = Iyy                                       # yaw — simetria
+        # momentos de inércia de casca cilíndrica oca (mais realista que sólido)
+        # Para casca: Ixx = m*R^2, Iyy ≈ m*(R^2/2 + L^2/12)
+        # Fator 0.7 em Ixx por distribuição não-uniforme de massa (componentes internos)
+        Ixx = 0.7  * m * R**2                          # roll — casca
+        Iyy = m * (0.5 * R**2 + L**2 / 12.0)          # pitch — casca
+        Izz = Iyy                                       # yaw — simetria axial
 
         M_rigid = np.diag([m, m, m, Ixx, Iyy, Izz])
         M_added = np.diag([

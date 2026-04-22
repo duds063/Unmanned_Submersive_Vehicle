@@ -226,9 +226,10 @@ class GeometryEngine:
         Z_ww = Y_vv  # simetria radial do cilindro
 
         # Arrasto rotacional — momento de arrasto por rotação
-        # M = 0.5 * rho * Cd * A * arm² * omega²
-        # arm médio = D/4 para roll, L/6 para pitch/yaw
-        K_pp = 0.5 * rho * Cd_f * h.A_frontal * (h.D / 4) ** 2
+        # Roll (K_pp): cilindro rotacionando em água tem amortecimento alto
+        # Fórmula de Hoerner para cilindro: Cd_roll ≈ 2.0 (muito maior que Cd_f)
+        # arm médio = R para roll (força na superfície), L/6 para pitch/yaw
+        K_pp = 0.5 * rho * 2.0 * h.A_lateral * (h.R) ** 2   # roll — amortecimento alto
         M_qq = 0.5 * rho * Cd_l * h.A_lateral * (h.L / 6) ** 2
         N_rr = M_qq  # simetria pitch/yaw
 
@@ -239,7 +240,7 @@ class GeometryEngine:
         X_u = 0.1 * X_uu
         Y_v = 0.1 * Y_vv
         Z_w = 0.1 * Z_ww
-        K_p = 0.1 * K_pp
+        K_p = 0.5 * K_pp   # roll linear: amortecimento viscoso alto (água + forma)
         M_q = 0.1 * M_qq
         N_r = 0.1 * N_rr
 

@@ -160,11 +160,6 @@ class SystemLinearizer:
         import copy
         self._physics_copy = copy.deepcopy(physics_engine)
 
-    @staticmethod
-    def operating_input() -> np.ndarray:
-        """Entrada de operação usada na linearização (u0)."""
-        return np.array([0.3, np.radians(15), np.radians(90), 0.0], dtype=float)
-
     def linearize(self, z0: float = 2.0) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula matrizes A e B por diferenciação numérica.
@@ -189,7 +184,7 @@ class SystemLinearizer:
         # CRÍTICO: power=0 zera o canal theta em B porque F_z = power*F_max*sin(theta)
         # é bilinear — dF_z/dtheta = power*F_max*cos(theta) = 0 quando power=0.
         # Com power=0.3 e theta=15°, todos os canais ficam visíveis na linearização.
-        u0 = self.operating_input()
+        u0 = np.array([0.3, np.radians(15), np.radians(90), 0.0])
 
         # Jacobiana A = ∂f/∂x numericamente
         A = np.zeros((12, 12))
@@ -307,20 +302,20 @@ class LQRController:
         physics_engine,
         weights:    LQRWeights = None,
         hover_depth: float = 2.0,
-        adaptive_relinearization: bool = True,
-        relinearization_interval_s: float = 1.0,
     ):
         self.physics     = physics_engine
         self.weights     = weights or LQRWeights()
         self.hover_depth = hover_depth
-        self.adaptive_relinearization = adaptive_relinearization
-        self.relinearization_interval_s = float(max(0.2, relinearization_interval_s))
-        self._last_relinearization_time = -np.inf
+
+        # inicializa ballast no ponto neutro antes de linearizar
+        # (garante que o ponto de operação da linearização é fisicamente válido)
+        half = 0.5 * (physics_engine.ballast.mass_max - physics_engine.ballast.mass_min)
+        mid  = physics_engine.ballast.mass_min + half
+        physics_engine.ballast._water_mass = mid
 
         # lineariza o sistema uma vez
         self.linearizer = SystemLinearizer(physics_engine)
         self.A, self.B  = self.linearizer.linearize(z0=hover_depth)
-        self._u_op      = self.linearizer.operating_input()
 
         # verifica controlabilidade
         ctrl = self.linearizer.check_controllability(self.A, self.B)
@@ -376,14 +371,6 @@ class LQRController:
         Returns:
             ControlCommand com comandos clipados
         """
-        # Re-lineariza periodicamente para reduzir mismatch longe do ponto nominal.
-        if self.adaptive_relinearization and (time - self._last_relinearization_time >= self.relinearization_interval_s):
-            z_lin = float(np.clip(ekf_state.eta[2], 0.1, 20.0))
-            self.A, self.B = self.linearizer.linearize(z0=z_lin)
-            self.K = self._solve_riccati()
-            self._u_op = self.linearizer.operating_input()
-            self._last_relinearization_time = time
-
         # monta vetor de estado do EKF
         x = np.concatenate([ekf_state.eta, ekf_state.nu])
 
@@ -393,9 +380,8 @@ class LQRController:
         # normaliza ângulos — evita erro de 350° quando deveria ser -10°
         error[3:6] = self._wrap_angles(error[3:6])
 
-        # lei de controle com feedforward no ponto de operação:
-        # u = u0 - K * (x - x_ref)
-        u = self._u_op - self.K @ error
+        # lei de controle LQR: u = -K * error
+        u = -self.K @ error
 
         # converte vetor de controle em comandos físicos
         cmd = self._control_to_command(u)
@@ -433,16 +419,17 @@ class LQRController:
         Q = self.weights.Q_matrix()
         R = self.weights.R_matrix()
 
-        # tenta resolver no sistema completo primeiro
+        # Resolve Riccati no subespaço controlável (estados u, v, w)
+        # O sistema tem rank=6/12: posições x,y,z,phi,tht,psi são integradoras
+        # (autovalor 0 estrutural) — controláveis indiretamente via velocidades.
+        # NÃO modificamos A artificialmente: isso distorceria o ganho.
+        # Em vez disso, resolvemos no subsistema realmente controlável.
         try:
-            # estabiliza A adicionando amortecimento pequeno
-            A_stab = self.A - np.eye(12) * 0.01
-            P = solve_continuous_are(A_stab, self.B, Q, R)
+            P = solve_continuous_are(self.A, self.B, Q, R)
             K = np.linalg.inv(R) @ self.B.T @ P
             return K
-
         except Exception:
-            pass
+            pass  # sistema singular — usa subespaço abaixo
 
         # fallback: LQR no subespaço controlável
         # identifica colunas de B com entrada real
@@ -520,11 +507,24 @@ class LQRController:
         u[2] → thruster_phi    — deflexão lateral (yaw/sway)
         u[3] → ballast_cmd     — controle de profundidade
         """
-        # A linearização foi feita diretamente nos canais dos atuadores,
-        # então u já está no mesmo espaço físico: [power, theta, phi, ballast].
-        power = np.clip(u[0], -1.0, 1.0)
-        theta = np.clip(u[1], 0.0, np.radians(60.0))
-        phi = float(u[2] % (2 * np.pi))
+        # normaliza power pelo máximo teórico
+        max_force = self.physics.thruster.max_force
+        power = np.clip(u[0] / max_force, -1.0, 1.0)
+
+        # theta: deflexão no plano vertical
+        # u[1] representa força vertical desejada → ângulo correspondente
+        if abs(u[0]) > 1e-3:
+            theta_raw = np.arctan2(abs(u[1]), abs(u[0]))
+        else:
+            theta_raw = np.radians(30) if abs(u[1]) > 0.1 else 0.0
+        theta = np.clip(theta_raw, 0.0, np.radians(60))
+
+        # phi: direção da deflexão no plano horizontal
+        # u[1] = componente Z (heave), u[2] = componente Y (sway)
+        phi = np.arctan2(u[1], u[2]) if (abs(u[1]) + abs(u[2])) > 1e-3 else 0.0
+
+        # ballast: u[3] já está na escala do LQR — clip direto
+        # (divisão por 10 anterior atenuava o sinal 10x sem justificativa)
         ballast = np.clip(u[3], -1.0, 1.0)
 
         return ControlCommand(
