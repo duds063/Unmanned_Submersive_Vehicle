@@ -44,6 +44,10 @@ SIM = {
     'trajectory':  [],   # últimos 500 pontos
     'max_traj':    500,
     'waypoints':   [],
+    'reference_frame': 'NED',
+    'rayleigh_enabled': False,
+    'rayleigh_sigma': 0.03,
+    'env_disturbance_scale': 0.0,
     'mode':        'free',  # free | training | inference
 }
 
@@ -72,7 +76,18 @@ def init_simulation():
     geo     = GeometryEngine(L=0.8, D=0.1)
     physics = PhysicsEngine(geo, max_thruster_force=10.0)
     env     = Environment(pool_depth=10.0, pool_radius=30.0)
-    sensors = SensorEngine(env, noise_scale=0.5, seed=42)
+    sensors = SensorEngine(
+      env,
+      noise_scale=0.5,
+      rayleigh_sigma=SIM['rayleigh_sigma'],
+      enable_rayleigh=SIM['rayleigh_enabled'],
+      seed=42,
+    )
+    sensors.set_environmental_disturbance(
+      enabled=SIM['rayleigh_enabled'],
+      scale=SIM['env_disturbance_scale'],
+      rayleigh_sigma=SIM['rayleigh_sigma'],
+    )
     ekf     = ExtendedKalmanFilter(physics)
     control = ControlEngine(physics, hover_depth=5.0)
 
@@ -207,6 +222,12 @@ def _emit_state(bundle, est, cmd):
         },
         'trajectory':        SIM['trajectory'][-50:],   # últimos 50 pontos
         'waypoints':         SIM['waypoints'],
+        'reference_frame':   SIM['reference_frame'],
+        'environmental_noise': {
+          'rayleigh_enabled': SIM['rayleigh_enabled'],
+          'rayleigh_sigma': SIM['rayleigh_sigma'],
+          'env_disturbance_scale': SIM['env_disturbance_scale'],
+        },
         'dynamic_obstacles': dyn_obs_data,
         'controller':        SIM['controller'],
         'command': cmd.to_dict(),
@@ -276,6 +297,40 @@ def on_add_waypoint(data):
     hrl.set_waypoints([np.array(w) for w in SIM['waypoints'][:5]])
     emit('status', {'waypoints': SIM['waypoints']})
 
+@socketio.on('set_waypoints')
+def on_set_waypoints(data):
+    """
+    Define lista completa de waypoints em coordenadas NED locais.
+    Formato esperado:
+      {"waypoints": [[x_north, y_east, z_down], ...]}
+    """
+    waypoints = data.get('waypoints', [])
+    if not isinstance(waypoints, list) or len(waypoints) == 0:
+        emit('status', {'error': 'waypoints inválidos'})
+        return
+
+    parsed = []
+    for wp in waypoints[:5]:
+        if not isinstance(wp, (list, tuple)) or len(wp) != 3:
+            continue
+        parsed.append([float(wp[0]), float(wp[1]), float(wp[2])])
+
+    if not parsed:
+        emit('status', {'error': 'nenhum waypoint válido'})
+        return
+
+    SIM['waypoints'] = parsed
+    first_wp = np.array(parsed[0], dtype=float)
+    control.set_reference(first_wp)
+    if SIM['controller'] == 'mpc':
+        control._mpc.set_reference(first_wp)
+    hrl.set_waypoints([np.array(w, dtype=float) for w in parsed])
+
+    emit('status', {
+        'waypoints': SIM['waypoints'],
+        'reference_frame': SIM['reference_frame'],
+    })
+
 
 @socketio.on('update_lqr_weights')
 def on_update_weights(data):
@@ -307,6 +362,30 @@ def on_noise_scale(data):
     scale = float(data.get('scale', 1.0))
     sensors.set_noise_scale(scale)
     emit('status', {'noise_scale': scale})
+
+
+@socketio.on('environmental_disturbance')
+def on_environmental_disturbance(data):
+  """Configura perturbação ambiental Rayleigh em runtime."""
+  enabled = bool(data.get('enabled', True))
+  sigma = float(data.get('rayleigh_sigma', SIM['rayleigh_sigma']))
+  scale = float(data.get('scale', SIM['env_disturbance_scale']))
+
+  SIM['rayleigh_enabled'] = enabled
+  SIM['rayleigh_sigma'] = max(0.0, sigma)
+  SIM['env_disturbance_scale'] = max(0.0, scale)
+
+  sensors.set_environmental_disturbance(
+    enabled=SIM['rayleigh_enabled'],
+    scale=SIM['env_disturbance_scale'],
+    rayleigh_sigma=SIM['rayleigh_sigma'],
+  )
+
+  emit('status', {
+    'rayleigh_enabled': SIM['rayleigh_enabled'],
+    'rayleigh_sigma': SIM['rayleigh_sigma'],
+    'env_disturbance_scale': SIM['env_disturbance_scale'],
+  })
 
 
 # ─────────────────────────────────────────────

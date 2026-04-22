@@ -54,6 +54,9 @@ class PipelineConfig:
     pool_depth: float = 10.0
     pool_radius: float = 30.0
     noise_scale: float = 0.5
+    enable_rayleigh: bool = False
+    rayleigh_sigma: float = 0.03
+    env_disturbance_scale: float = 1.0
     seed: int = 42
     fresh: bool = False
     checkpoint_dir: str = "./checkpoints"
@@ -87,7 +90,18 @@ def build_stack(config: PipelineConfig):
     physics = PhysicsEngine(geometry, max_thruster_force=10.0)
     env = Environment(pool_depth=config.pool_depth, pool_radius=config.pool_radius)
     env.add_sphere(np.array([5.0, 0.0, 3.0], dtype=float), radius=1.0)
-    sensors = SensorEngine(env, noise_scale=config.noise_scale, seed=config.seed)
+    sensors = SensorEngine(
+        env,
+        noise_scale=config.noise_scale,
+        rayleigh_sigma=config.rayleigh_sigma,
+        enable_rayleigh=config.enable_rayleigh,
+        seed=config.seed,
+    )
+    sensors.set_environmental_disturbance(
+        enabled=config.enable_rayleigh,
+        scale=config.env_disturbance_scale,
+        rayleigh_sigma=config.rayleigh_sigma,
+    )
     ekf = ExtendedKalmanFilter(physics)
 
     control = ControlEngine(physics, hover_depth=config.hover_depth)
@@ -321,6 +335,12 @@ def parse_args() -> PipelineConfig:
     parser.add_argument("--pool-depth", type=float, default=10.0)
     parser.add_argument("--pool-radius", type=float, default=30.0)
     parser.add_argument("--noise-scale", type=float, default=0.5)
+    parser.add_argument("--enable-rayleigh", action="store_true",
+                        help="Ativa perturbação ambiental não gaussiana (Rayleigh).")
+    parser.add_argument("--rayleigh-sigma", type=float, default=0.03,
+                        help="Escala da distribuição de Rayleigh para a maresia.")
+    parser.add_argument("--env-disturbance-scale", type=float, default=1.0,
+                        help="Intensidade global da perturbação ambiental Rayleigh.")
     parser.add_argument("--waypoint-threshold", type=float, default=0.5,
                         help="Raio (m) para considerar waypoint atingido.")
     parser.add_argument("--seed", type=int, default=42)
@@ -341,6 +361,9 @@ def parse_args() -> PipelineConfig:
         pool_depth=args.pool_depth,
         pool_radius=args.pool_radius,
         noise_scale=args.noise_scale,
+        enable_rayleigh=args.enable_rayleigh,
+        rayleigh_sigma=args.rayleigh_sigma,
+        env_disturbance_scale=args.env_disturbance_scale,
         waypoint_threshold=args.waypoint_threshold,
         seed=args.seed,
         fresh=args.fresh,

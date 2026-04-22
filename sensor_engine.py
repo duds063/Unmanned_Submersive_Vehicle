@@ -6,6 +6,7 @@ Simula o stack de sensores real do USV com ruído realista:
     IMU     — aceleração linear/angular + ruído gaussiano
     Sonar   — 6 transdutores ortogonais Open Echo (200kHz, 7m, 25°)
     Barômetro — pressão → profundidade (MS5837)
+    Distúrbio ambiental — maresia/turbulência com ruído não gaussiano (Rayleigh)
     Depth Map — recebe frame do Three.js via WebSocket
 
 Extended Kalman Filter (EKF) — módulo separado
@@ -46,6 +47,9 @@ IMU_GYRO_BIAS_STD    = 0.0005   # rad/s
 BARO_NOISE_STD       = 0.01     # m — precisão de profundidade
 RHO_FRESHWATER       = 1000.0
 G                    = 9.81
+
+# Distúrbio ambiental não gaussiano (Rayleigh)
+RAYLEIGH_DEFAULT_SIGMA = 0.03  # escala base para perturbações ambientais
 
 
 # ─────────────────────────────────────────────
@@ -291,6 +295,8 @@ class SensorEngine:
         self,
         environment: Environment,
         noise_scale: float = 1.0,   # 0 = sem ruído, 1 = ruído real, >1 = exagerado
+        rayleigh_sigma: float = RAYLEIGH_DEFAULT_SIGMA,
+        enable_rayleigh: bool = False,
         seed:        int   = 42,
     ):
         self.env         = environment
@@ -302,14 +308,29 @@ class SensorEngine:
         self._gyro_bias  = np.zeros(3)
         self._bias_drift_rate = 0.001  # rad/s por segundo
 
+        # histórico para derivar aceleração linear verdadeira no body frame
+        self._last_imu_time: Optional[float] = None
+        self._last_body_vel: Optional[np.ndarray] = None
+
+        # perturbações ambientais (maresia) no referencial do mundo
+        self.rayleigh_sigma = max(0.0, float(rayleigh_sigma))
+        self.enable_rayleigh = bool(enable_rayleigh)
+        self.environment_scale = 0.0
+        self._env_current_world = np.zeros(3)
+        self._env_turbulence = 0.0
+        self._last_env_time: Optional[float] = None
+
         # timer de atualização do sonar
         self._last_sonar_update = -1.0
         self._sonar_dt = 1.0 / SONAR_UPDATE_HZ
+        self._last_sonar_readings: List[SonarReading] = []
 
     # ─── Interface pública ───────────────────
 
     def read(self, state: VehicleState, time: float) -> SensorBundle:
         """Lê todos os sensores dado o estado físico real."""
+        self._update_environmental_state(time)
+
         imu       = self._read_imu(state, time)
         sonar     = self._read_sonar(state, time)
         barometer = self._read_barometer(state, time)
@@ -325,6 +346,72 @@ class SensorEngine:
         """Ajusta nível de ruído em runtime — útil pra domain randomization."""
         self.noise_scale = max(0.0, scale)
 
+    def set_environmental_disturbance(
+        self,
+        enabled: bool,
+        scale: float = 1.0,
+        rayleigh_sigma: Optional[float] = None,
+    ) -> None:
+        """
+        Configura perturbação ambiental não gaussiana (Rayleigh).
+
+        Args:
+            enabled: ativa/desativa efeito de maresia/turbulência.
+            scale: intensidade global do efeito (0 = desligado).
+            rayleigh_sigma: escala da distribuição de Rayleigh.
+        """
+        self.enable_rayleigh = bool(enabled)
+        self.environment_scale = max(0.0, float(scale))
+        if rayleigh_sigma is not None:
+            self.rayleigh_sigma = max(0.0, float(rayleigh_sigma))
+
+        if (not self.enable_rayleigh) or self.environment_scale == 0.0:
+            self._env_current_world[:] = 0.0
+            self._env_turbulence = 0.0
+
+    def _signed_rayleigh_noise(self, size=None) -> np.ndarray:
+        """Amostra ruído Rayleigh com sinal aleatório para perturbações bidirecionais."""
+        if size is None:
+            amp = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
+            sign = -1.0 if self.rng.random() < 0.5 else 1.0
+            return np.array(sign * amp)
+
+        amp = self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9), size=size)
+        sign = np.where(self.rng.random(size=size) < 0.5, -1.0, 1.0)
+        return amp * sign
+
+    def _update_environmental_state(self, time: float) -> None:
+        """Atualiza corrente/turbulência ambiental com dinâmica lenta."""
+        if not self.enable_rayleigh or self.environment_scale <= 0.0:
+            self._env_current_world[:] = 0.0
+            self._env_turbulence = 0.0
+            self._last_env_time = time
+            return
+
+        if self._last_env_time is None:
+            dt_env = 0.0
+        else:
+            dt_env = max(0.0, time - self._last_env_time)
+        self._last_env_time = time
+
+        if dt_env <= 0.0:
+            return
+
+        tau = 2.0
+        alpha = 1.0 - np.exp(-dt_env / tau)
+
+        direction = self.rng.normal(0.0, 1.0, 3)
+        direction /= (np.linalg.norm(direction) + 1e-9)
+        amp = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
+        target_current = direction * amp * self.environment_scale
+        self._env_current_world = (
+            (1.0 - alpha) * self._env_current_world +
+            alpha * target_current
+        )
+
+        turb_target = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
+        self._env_turbulence = (1.0 - alpha) * self._env_turbulence + alpha * turb_target
+
     # ─── IMU ─────────────────────────────────
 
     def _read_imu(self, state: VehicleState, time: float) -> IMUReading:
@@ -332,8 +419,19 @@ class SensorEngine:
         Simula IMU com ruído gaussiano e bias derivante.
         Aceleração inclui gravidade projetada no body frame.
         """
-        # aceleração verdadeira (aproximação — derivada de nu)
-        # na prática o IMU mede força específica = a - g
+        # aceleração linear no body frame por diferença finita em ν linear.
+        # no hardware real viria diretamente da dinâmica do IMU.
+        body_vel = np.array([state.u, state.v, state.w], dtype=float)
+        if self._last_imu_time is None or self._last_body_vel is None:
+            linear_accel_body = np.zeros(3)
+        else:
+            dt_imu = max(1e-6, time - self._last_imu_time)
+            linear_accel_body = (body_vel - self._last_body_vel) / dt_imu
+
+        self._last_imu_time = time
+        self._last_body_vel = body_vel.copy()
+
+        # na prática o acelerômetro mede aceleração específica + projeção da gravidade
         phi, theta = state.phi, state.tht
         g_body = np.array([
             -G * np.sin(theta),
@@ -354,8 +452,13 @@ class SensorEngine:
         accel_noise = self.rng.normal(0, IMU_ACCEL_NOISE_STD * self.noise_scale, 3)
         gyro_noise  = self.rng.normal(0, IMU_GYRO_NOISE_STD  * self.noise_scale, 3)
 
+        # componente não gaussiana (maresia/turbulência)
+        if self.enable_rayleigh and self.environment_scale > 0.0:
+            accel_noise += self._signed_rayleigh_noise(size=3) * 0.2 * self.environment_scale
+            gyro_noise  += self._signed_rayleigh_noise(size=3) * 0.01 * self.environment_scale
+
         # leitura ruidosa
-        accel_meas = g_body       + self._accel_bias + accel_noise
+        accel_meas = linear_accel_body + g_body + self._accel_bias + accel_noise
         gyro_meas  = true_gyro   + self._gyro_bias  + gyro_noise
 
         return IMUReading(accel=accel_meas, gyro=gyro_meas, timestamp=time)
@@ -391,6 +494,14 @@ class SensorEngine:
                 # ruído acústico — aumenta com distância
                 noise_std = (0.02 + 0.01 * dist) * self.noise_scale
                 dist_meas = dist + self.rng.normal(0, noise_std)
+
+                if self.enable_rayleigh and self.environment_scale > 0.0:
+                    rayleigh_noise = float(
+                        self._signed_rayleigh_noise() * (0.015 + 0.005 * dist) * self.environment_scale
+                    )
+                    dist_meas += rayleigh_noise
+                    conf *= float(np.exp(-0.35 * self._env_turbulence * self.environment_scale))
+
                 dist_meas = max(SONAR_MIN_RANGE, dist_meas)
 
                 # simula beamwidth — média de raios dentro do cone
@@ -455,6 +566,10 @@ class SensorEngine:
         true_depth = state.z  # NED: z positivo = profundidade
         pressure   = RHO_FRESHWATER * G * true_depth
         noise      = self.rng.normal(0, BARO_NOISE_STD * self.noise_scale)
+        if self.enable_rayleigh and self.environment_scale > 0.0:
+            noise += float(
+                self._signed_rayleigh_noise() * BARO_NOISE_STD * 0.8 * self.environment_scale
+            )
         depth_meas = true_depth + noise
 
         return BarometerReading(
@@ -518,10 +633,10 @@ class ExtendedKalmanFilter:
 
         # estado inicial — veículo na origem parado
         self._x = np.zeros(self.DIM_STATE)
-        self._x[9] = 1.0   # quaternion w=1 implícito nos Euler zeros
         self._P = np.eye(self.DIM_STATE) * 0.1
 
         self._time = 0.0
+        self._last_imu_timestamp: Optional[float] = None
 
     @property
     def state_estimate(self) -> EKFState:
@@ -549,17 +664,74 @@ class ExtendedKalmanFilter:
         self._time += dt
 
     def update_imu(self, reading: IMUReading) -> None:
-        """Atualiza com leitura do IMU."""
-        # observação esperada dado estado atual
-        h = self._h_imu(self._x)
+        """
+        Atualiza com leitura do IMU.
 
-        # medição real
-        z = np.concatenate([reading.accel, reading.gyro])
+        Pipeline:
+          1) Dead Reckoning: integra gyro e aceleração específica em posição/velocidade.
+          2) Correção EKF: usa gyro como observação direta de [p,q,r].
+          3) Correção complementar: usa gravidade no acelerômetro para limitar drift de roll/pitch.
+        """
+        if self._last_imu_timestamp is None:
+            dt_imu = 0.0
+        else:
+            dt_imu = max(0.0, reading.timestamp - self._last_imu_timestamp)
+        self._last_imu_timestamp = reading.timestamp
 
-        # Jacobiana de medição
-        H = self._H_imu(self._x)
+        if dt_imu > 0.0:
+            # Dead Reckoning angular: integra taxas em Euler
+            omega = reading.gyro.astype(float)
+            phi, theta, psi = self._x[3], self._x[4], self._x[5]
 
-        self._update(z, h, H, self.R_imu)
+            cphi = np.cos(phi); sphi = np.sin(phi)
+            cth  = np.cos(theta)
+            if abs(cth) < 1e-4:
+                cth = np.sign(cth) * 1e-4 if cth != 0 else 1e-4
+            tth  = np.tan(theta)
+
+            T = np.array([
+                [1, sphi * tth, cphi * tth],
+                [0, cphi,      -sphi],
+                [0, sphi / cth, cphi / cth],
+            ])
+            self._x[3:6] += (T @ omega) * dt_imu
+            self._x[3:6] = ((self._x[3:6] + np.pi) % (2 * np.pi)) - np.pi
+
+            # Dead Reckoning linear: a_body = accel - g_body(orientação estimada)
+            phi, theta, psi = self._x[3], self._x[4], self._x[5]
+            g_body = np.array([
+                -G * np.sin(theta),
+                 G * np.cos(theta) * np.sin(phi),
+                 G * np.cos(theta) * np.cos(phi),
+            ])
+            a_body = reading.accel.astype(float) - g_body
+
+            self._x[6:9] += a_body * dt_imu
+
+            R = SensorEngine._rotation_matrix(phi, theta, psi)
+            v_world = R @ self._x[6:9]
+            self._x[:3] += v_world * dt_imu
+
+            # gyro observado diretamente como velocidade angular
+            self._x[9:12] = omega
+
+            # Complementary correction em roll/pitch usando vetor gravidade medido
+            ax, ay, az = reading.accel.astype(float)
+            phi_acc = np.arctan2(ay, az)
+            theta_acc = np.arctan2(-ax, np.sqrt(ay**2 + az**2) + 1e-9)
+            alpha = 0.03
+            self._x[3] = (1.0 - alpha) * self._x[3] + alpha * phi_acc
+            self._x[4] = (1.0 - alpha) * self._x[4] + alpha * theta_acc
+
+        # atualização EKF explícita para gyro (mantém consistência da covariância)
+        z = reading.gyro.astype(float)
+        h = self._x[9:12].copy()
+        H = np.zeros((3, self.DIM_STATE))
+        H[0, 9] = 1.0
+        H[1, 10] = 1.0
+        H[2, 11] = 1.0
+        Rg = np.diag([IMU_GYRO_NOISE_STD**2] * 3)
+        self._update(z, h, H, Rg)
 
     def update_sonar(self, readings: List[SonarReading]) -> None:
         """Atualiza com leituras do sonar — só usa hits válidos."""
@@ -670,6 +842,7 @@ class ExtendedKalmanFilter:
         self._x = initial_state if initial_state is not None else np.zeros(self.DIM_STATE)
         self._P = np.eye(self.DIM_STATE) * 0.1
         self._time = 0.0
+        self._last_imu_timestamp = None
 
 
 # ─────────────────────────────────────────────
