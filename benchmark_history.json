@@ -1,0 +1,154 @@
+[
+  {
+    "label": "baseline original",
+    "saved_at_epoch_s": 1776876600,
+    "scenario": {
+      "trials": null,
+      "max_steps": null,
+      "dt": null,
+      "noise_scale": null,
+      "rayleigh_enabled": null,
+      "waypoints": []
+    },
+    "ranking": [
+      {"controller": "mpc", "score": -135.9, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 5.47, "mean_final_error_m": 6.77, "mean_time_s": 8.7, "mean_energy_score": 14.02, "mean_compute_ms": 11.73},
+      {"controller": "lqr", "score": -155.9, "success_rate": 0.0, "collision_rate": 0.5, "mean_tracking_error_m": 9.47, "mean_final_error_m": 6.63, "mean_time_s": 24.7, "mean_energy_score": 52.04, "mean_compute_ms": 0.60},
+      {"controller": "rl", "score": -201.6, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 18.76, "mean_final_error_m": 9.56, "mean_time_s": 40.0, "mean_energy_score": 65.39, "mean_compute_ms": 1.31}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776877200,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.472},
+      {"controller": "rl", "score": -139.255, "success_rate": 0.0, "collision_rate": 0.667, "mean_tracking_error_m": 10.501, "mean_final_error_m": 6.2, "mean_time_s": 19.993, "mean_energy_score": 15.269, "mean_compute_ms": 1.688},
+      {"controller": "lqr", "score": -142.307, "success_rate": 0.0, "collision_rate": 0.667, "mean_tracking_error_m": 11.473, "mean_final_error_m": 5.598, "mean_time_s": 20.133, "mean_energy_score": 17.582, "mean_compute_ms": 1.068}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776877800,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.213},
+      {"controller": "lqr", "score": -121.02, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 16.268, "mean_final_error_m": 3.721, "mean_time_s": 25.0, "mean_energy_score": 23.672, "mean_compute_ms": 0.379},
+      {"controller": "rl", "score": -174.893, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 11.863, "mean_final_error_m": 7.387, "mean_time_s": 18.54, "mean_energy_score": 16.308, "mean_compute_ms": 0.809}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776878400,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.163},
+      {"controller": "lqr", "score": -71.666, "success_rate": 0.333, "collision_rate": 0.667, "mean_tracking_error_m": 6.511, "mean_final_error_m": 6.417, "mean_time_s": 14.5, "mean_energy_score": 14.95, "mean_compute_ms": 0.339},
+      {"controller": "rl", "score": -128.994, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 15.694, "mean_final_error_m": 5.604, "mean_time_s": 25.0, "mean_energy_score": 24.2, "mean_compute_ms": 0.727}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776879000,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "lqr", "score": -56.194, "success_rate": 0.333, "collision_rate": 0.333, "mean_tracking_error_m": 7.915, "mean_final_error_m": 5.345, "mean_time_s": 21.31, "mean_energy_score": 19.073, "mean_compute_ms": 0.294},
+      {"controller": "mpc", "score": -101.243, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 9.213, "mean_final_error_m": 6.804, "mean_time_s": 25.0, "mean_energy_score": 22.271, "mean_compute_ms": 0.157}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776879600,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": -21.255, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 8.099, "mean_final_error_m": 3.65, "mean_time_s": 18.877, "mean_energy_score": 15.48, "mean_compute_ms": 0.158},
+      {"controller": "lqr", "score": -34.166, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 11.847, "mean_final_error_m": 2.957, "mean_time_s": 18.343, "mean_energy_score": 14.745, "mean_compute_ms": 0.308}
+    ],
+    "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1776880200,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.205},
+      {"controller": "lqr", "score": -58.992, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 16.005, "mean_final_error_m": 3.025, "mean_time_s": 17.97, "mean_energy_score": 17.194, "mean_compute_ms": 0.319}
+    ],
+    "controllers": {}
+  },
+  {
+    "label": "rayleigh on baseline",
+    "saved_at_epoch_s": 1776880800,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": true,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 37.877, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 8.008, "mean_final_error_m": 2.569, "mean_time_s": 11.497, "mean_energy_score": 9.317, "mean_compute_ms": 0.193},
+      {"controller": "rl", "score": -137.109, "success_rate": 0.0, "collision_rate": 0.333, "mean_tracking_error_m": 12.675, "mean_final_error_m": 7.012, "mean_time_s": 22.9, "mean_energy_score": 20.978, "mean_compute_ms": 0.722},
+      {"controller": "lqr", "score": -166.694, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 10.642, "mean_final_error_m": 6.319, "mean_time_s": 21.367, "mean_energy_score": 20.527, "mean_compute_ms": 0.332}
+    ],
+    "controllers": {}
+  },
+  {
+    "label": "rayleigh on lqr tuned",
+    "saved_at_epoch_s": 1776881400,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2500,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": true,
+      "waypoints": [[5.0, 0.0, 5.0]]
+    },
+    "ranking": [
+      {"controller": "mpc", "score": 37.877, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 8.008, "mean_final_error_m": 2.569, "mean_time_s": 11.497, "mean_energy_score": 9.317, "mean_compute_ms": 0.235},
+      {"controller": "lqr", "score": -106.964, "success_rate": 0.0, "collision_rate": 0.333, "mean_tracking_error_m": 9.615, "mean_final_error_m": 4.843, "mean_time_s": 22.233, "mean_energy_score": 16.26, "mean_compute_ms": 0.346}
+    ],
+    "controllers": {}
+  }
+]
