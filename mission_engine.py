@@ -36,6 +36,9 @@ from mpc_controller  import integrate_mpc
 from rl_controller   import HRLController, integrate_rl
 
 
+EARTH_RADIUS_M = 6378137.0
+
+
 # ─────────────────────────────────────────────
 # ENUMS E CONSTANTES
 # ─────────────────────────────────────────────
@@ -260,6 +263,13 @@ class DomainRandomizer:
         # ── ruído de sensor ──────────────────
         sensors.set_noise_scale(self.rng.uniform(0.5, 1.5))
 
+        # ── maresia/turbulência não gaussiana (Rayleigh) ──
+        sensors.set_environmental_disturbance(
+            enabled=True,
+            scale=self.rng.uniform(0.5, 1.5),
+            rayleigh_sigma=self.rng.uniform(0.02, 0.08),
+        )
+
     def _reset_to_nominal(
         self,
         physics: PhysicsEngine,
@@ -267,6 +277,7 @@ class DomainRandomizer:
     ) -> None:
         """Reseta parâmetros para valores nominais."""
         sensors.set_noise_scale(0.0 if True else 1.0)
+        sensors.set_environmental_disturbance(enabled=False, scale=0.0)
 
 
 # ─────────────────────────────────────────────
@@ -347,6 +358,10 @@ class MissionEngine:
         self.randomizer = DomainRandomizer(self.rng)
         self.dynamic_obstacles: List[DynamicObstacle] = []
 
+        # referência global local (NED) para waypoints especificados manualmente
+        self._fixed_waypoints: Optional[List[np.ndarray]] = None
+        self._geodetic_origin: Optional[np.ndarray] = None  # [lat_deg, lon_deg, alt_m]
+
         # curriculum
         self._phase   = CurriculumPhase.PHASE_1
         self._phase_rewards: Dict[CurriculumPhase, deque] = {
@@ -417,6 +432,49 @@ class MissionEngine:
         self.hrl.set_waypoints(waypoints)
         return self._run_episode(dt=dt, training=False, max_steps=max_steps)
 
+    def set_waypoints_local(self, waypoints_ned: List[np.ndarray]) -> None:
+        """
+        Define waypoints fixos no referencial global local NED [x_north, y_east, z_down].
+        Quando definidos, substituem os waypoints aleatórios do gerador.
+        """
+        if not waypoints_ned:
+            raise ValueError("Lista de waypoints local está vazia.")
+        self._fixed_waypoints = [np.asarray(wp, dtype=float).copy() for wp in waypoints_ned]
+
+    def clear_waypoints_local(self) -> None:
+        """Remove waypoints fixos e volta ao gerador aleatório do curriculum."""
+        self._fixed_waypoints = None
+
+    def set_geodetic_origin(self, lat_deg: float, lon_deg: float, alt_m: float = 0.0) -> None:
+        """Define origem geodésica para conversão lat/lon/alt -> NED local."""
+        self._geodetic_origin = np.array([lat_deg, lon_deg, alt_m], dtype=float)
+
+    def set_waypoints_geodetic(self, waypoints_lla: List[Tuple[float, float, float]]) -> None:
+        """
+        Define waypoints em coordenadas geodésicas (lat_deg, lon_deg, alt_m).
+        Converte para NED local usando aproximação de plano tangente.
+        """
+        if self._geodetic_origin is None:
+            raise RuntimeError("Origem geodésica não definida. Use set_geodetic_origin().")
+        if not waypoints_lla:
+            raise ValueError("Lista de waypoints geodésicos está vazia.")
+
+        lat0, lon0, alt0 = self._geodetic_origin
+        lat0_rad = np.radians(lat0)
+        cos_lat0 = np.cos(lat0_rad)
+        waypoints_ned: List[np.ndarray] = []
+
+        for lat_deg, lon_deg, alt_m in waypoints_lla:
+            dlat = np.radians(lat_deg - lat0)
+            dlon = np.radians(lon_deg - lon0)
+
+            north = EARTH_RADIUS_M * dlat
+            east = EARTH_RADIUS_M * cos_lat0 * dlon
+            down = alt0 - alt_m
+            waypoints_ned.append(np.array([north, east, down], dtype=float))
+
+        self.set_waypoints_local(waypoints_ned)
+
     # ─── Loop de episódio ────────────────────
 
     def _run_episode(
@@ -431,7 +489,10 @@ class MissionEngine:
 
         # ── Setup do episódio ─────────────────
         start_pos   = np.array([0.0, 0.0, self.pool_depth / 2])
-        waypoints   = self.ep_gen.generate_waypoints(self._phase, start_pos)
+        if self._fixed_waypoints is not None:
+            waypoints = [wp.copy() for wp in self._fixed_waypoints]
+        else:
+            waypoints = self.ep_gen.generate_waypoints(self._phase, start_pos)
         static_obs  = self.ep_gen.generate_static_obstacles(
             self._phase, waypoints, start_pos
         )
@@ -453,6 +514,7 @@ class MissionEngine:
         }
         if self._phase != CurriculumPhase.PHASE_3:
             self.sensors.set_noise_scale(noise_by_phase[self._phase])
+            self.sensors.set_environmental_disturbance(enabled=False, scale=0.0)
 
         # reseta sistemas com profundidade inicial correta
         from physics_engine import VehicleState
