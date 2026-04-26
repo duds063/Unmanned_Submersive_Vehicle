@@ -17,9 +17,12 @@ from control_engine import ControlEngine
 from mpc_controller import integrate_mpc
 from rl_controller import integrate_rl
 from mission_engine import COLLISION_THRESHOLD, DynamicObstacle, EpisodeTermination
+from replay_exporter import ReplayExporter
 
 
 DEFAULT_MAX_STEPS = 2000
+DEFAULT_BENCHMARK_MODE = "mission"
+BENCHMARK_MODES = ("mission", "stability")
 
 
 @dataclass
@@ -37,10 +40,15 @@ class BenchmarkScenario:
     rayleigh_sigma: float = 0.03
     env_disturbance_scale: float = 0.0
     seed: int = 42
+    benchmark_mode: str = DEFAULT_BENCHMARK_MODE
+    hold_position: Optional[List[float]] = None
+    position_tolerance_m: float = 0.75
+    attitude_tolerance_deg: float = 12.0
 
 
 @dataclass
 class BenchmarkRunResult:
+    benchmark_mode: str
     controller: str
     trial: int
     termination: str
@@ -55,12 +63,18 @@ class BenchmarkRunResult:
     mean_tracking_error_m: float
     rms_tracking_error_m: float
     final_position_error_m: float
+    mean_attitude_error_deg: float
+    rms_attitude_error_deg: float
+    final_attitude_error_deg: float
     min_clearance_m: float
     path_length_m: float
     mean_speed_mps: float
     mean_compute_ms: float
     energy_score: float
     score: float
+    replay_run_id: Optional[str] = None
+    replay_frames_path: Optional[str] = None
+    replay_meta_path: Optional[str] = None
 
 
 def _mean(values: List[float]) -> float:
@@ -72,8 +86,15 @@ def _std(values: List[float]) -> float:
 
 
 class ControllerBenchmark:
-    def __init__(self, checkpoint_dir: str = "./checkpoints"):
+    def __init__(
+        self,
+        checkpoint_dir: str = "./checkpoints",
+        replay_dir: str = "./training_runs/replays",
+        enable_replay_export: bool = True,
+    ):
         self.checkpoint_dir = checkpoint_dir
+        self.enable_replay_export = bool(enable_replay_export)
+        self.replay_exporter = ReplayExporter(replay_dir) if self.enable_replay_export else None
 
     def run(
         self,
@@ -81,8 +102,10 @@ class ControllerBenchmark:
         controllers: Optional[List[str]] = None,
         progress_callback=None,
     ) -> Dict:
+        scenario = self._normalize_scenario(scenario)
         controller_list = controllers or ["lqr", "mpc", "rl"]
         runs: List[BenchmarkRunResult] = []
+        replay_runs: List[Dict] = []
         total_runs = len(controller_list) * scenario.trials
         run_index = 0
 
@@ -98,7 +121,10 @@ class ControllerBenchmark:
                         "trials": scenario.trials,
                         "progress": run_index / total_runs,
                     })
-                runs.append(self._run_once(controller, scenario, trial_seed, trial + 1))
+                run_result, replay_manifest = self._run_once(controller, scenario, trial_seed, trial + 1)
+                runs.append(run_result)
+                if replay_manifest is not None:
+                    replay_runs.append(replay_manifest)
 
         grouped: Dict[str, List[BenchmarkRunResult]] = {name: [] for name in controller_list}
         for run in runs:
@@ -106,9 +132,11 @@ class ControllerBenchmark:
 
         summary = {
             "scenario": asdict(scenario),
+            "benchmark_mode": scenario.benchmark_mode,
             "generated_at_epoch_s": time.time(),
             "runs": [asdict(run) for run in runs],
             "controllers": {},
+            "replays": replay_runs,
         }
 
         for controller in controller_list:
@@ -126,6 +154,9 @@ class ControllerBenchmark:
                 "mean_tracking_error_m": _mean([r.mean_tracking_error_m for r in controller_runs]),
                 "rms_tracking_error_m": _mean([r.rms_tracking_error_m for r in controller_runs]),
                 "mean_final_error_m": _mean([r.final_position_error_m for r in controller_runs]),
+                "mean_attitude_error_deg": _mean([r.mean_attitude_error_deg for r in controller_runs]),
+                "rms_attitude_error_deg": _mean([r.rms_attitude_error_deg for r in controller_runs]),
+                "mean_final_attitude_error_deg": _mean([r.final_attitude_error_deg for r in controller_runs]),
                 "mean_clearance_m": _mean([r.min_clearance_m for r in controller_runs]),
                 "mean_path_length_m": _mean([r.path_length_m for r in controller_runs]),
                 "mean_speed_mps": _mean([r.mean_speed_mps for r in controller_runs]),
@@ -145,13 +176,28 @@ class ControllerBenchmark:
         summary["ranking"] = ranking
         return summary
 
+    @staticmethod
+    def _normalize_scenario(scenario: BenchmarkScenario) -> BenchmarkScenario:
+        mode = str(getattr(scenario, "benchmark_mode", DEFAULT_BENCHMARK_MODE) or DEFAULT_BENCHMARK_MODE).lower()
+        if mode not in BENCHMARK_MODES:
+            raise ValueError(f"Unsupported benchmark_mode '{mode}'. Expected one of {BENCHMARK_MODES}.")
+
+        scenario.benchmark_mode = mode
+        if scenario.hold_position is None:
+            scenario.hold_position = [0.0, 0.0, scenario.pool_depth / 2.0]
+        else:
+            scenario.hold_position = [float(v) for v in scenario.hold_position]
+        scenario.position_tolerance_m = float(scenario.position_tolerance_m)
+        scenario.attitude_tolerance_deg = float(scenario.attitude_tolerance_deg)
+        return scenario
+
     def _run_once(
         self,
         controller_name: str,
         scenario: BenchmarkScenario,
         seed: int,
         trial_number: int,
-    ) -> BenchmarkRunResult:
+    ) -> tuple[BenchmarkRunResult, Optional[Dict]]:
         rng = np.random.default_rng(seed)
         geo = GeometryEngine(L=0.8, D=0.1)
         physics = PhysicsEngine(geo, max_thruster_force=10.0)
@@ -193,8 +239,13 @@ class ControllerBenchmark:
         env.obstacles.extend([obs.to_obstacle() for obs in dynamic_obstacles])
 
         waypoints = [np.array(wp, dtype=float) for wp in scenario.waypoints]
-        control.set_waypoints([wp.copy() for wp in waypoints])
-        hrl.set_waypoints([wp.copy() for wp in waypoints])
+        hold_position = np.array(scenario.hold_position or [0.0, 0.0, scenario.pool_depth / 2.0], dtype=float)
+        if scenario.benchmark_mode == "stability":
+            control.set_reference(hold_position)
+            hrl.set_waypoints([hold_position.copy()])
+        else:
+            control.set_waypoints([wp.copy() for wp in waypoints])
+            hrl.set_waypoints([wp.copy() for wp in waypoints])
         if controller_name in ("lqr", "mpc"):
             with self._quiet_stdout():
                 control.set_controller(controller_name)
@@ -203,8 +254,19 @@ class ControllerBenchmark:
         physics.reset(initial_state)
         ekf.reset(np.concatenate([initial_state.eta, initial_state.nu]))
 
+        replay_writer = None
+        if self.replay_exporter is not None:
+            replay_writer = self.replay_exporter.start_run(
+                benchmark_mode=scenario.benchmark_mode,
+                controller=controller_name,
+                trial=trial_number,
+                seed=seed,
+                scenario=asdict(scenario),
+            )
+
         steps = 0
         error_samples: List[float] = []
+        attitude_error_samples_deg: List[float] = []
         speed_samples: List[float] = []
         compute_samples_ms: List[float] = []
         min_clearance = float("inf")
@@ -228,9 +290,10 @@ class ControllerBenchmark:
             ekf.update_sonar(bundle.sonar)
             est = ekf.state_estimate
 
-            target = self._current_target(controller_name, control, hrl, waypoints)
+            target = self._current_target(controller_name, control, hrl, waypoints, scenario)
             if target is not None:
                 error_samples.append(float(np.linalg.norm(est.position - target)))
+            attitude_error_samples_deg.append(self._attitude_error_deg(est))
 
             t0 = time.perf_counter()
             if controller_name == "rl":
@@ -273,51 +336,169 @@ class ControllerBenchmark:
                 termination = EpisodeTermination.COLLISION
             elif self._out_of_bounds(pos, scenario):
                 termination = EpisodeTermination.OUT_OF_BOUNDS
-            elif self._mission_complete(controller_name, control, hrl):
+            elif scenario.benchmark_mode == "mission" and self._mission_complete(controller_name, control, hrl):
                 termination = EpisodeTermination.MISSION_COMPLETE
 
+            if replay_writer is not None:
+                physics_data = physics.to_dict()
+                tracking_error = float(error_samples[-1]) if error_samples else float("nan")
+                attitude_error_deg = float(attitude_error_samples_deg[-1]) if attitude_error_samples_deg else 0.0
+                replay_writer.write_frame({
+                    "step": steps,
+                    "time": float(physics.time),
+                    "benchmark_mode": scenario.benchmark_mode,
+                    "controller": controller_name,
+                    "trial": trial_number,
+                    "state_true": {
+                        "position": [float(physics.state.x), float(physics.state.y), float(physics.state.z)],
+                        "quaternion": [
+                            float(physics.state.qw),
+                            float(physics.state.qx),
+                            float(physics.state.qy),
+                            float(physics.state.qz),
+                        ],
+                        "euler": [float(physics.state.phi), float(physics.state.tht), float(physics.state.psi)],
+                        "velocity_linear": [float(physics.state.u), float(physics.state.v), float(physics.state.w)],
+                        "velocity_angular": [float(physics.state.p), float(physics.state.q), float(physics.state.r)],
+                    },
+                    "ekf_estimate": {
+                        "eta": est.eta,
+                        "nu": est.nu,
+                        "position": est.position,
+                        "orientation": est.orientation,
+                        "velocity_linear": est.velocity_linear,
+                        "velocity_angular": est.velocity_angular,
+                    },
+                    "command": cmd.to_dict(),
+                    "sensors": bundle.to_dict(),
+                    "environment": {
+                        "pool_depth": float(scenario.pool_depth),
+                        "pool_radius": float(scenario.pool_radius),
+                        "rayleigh_enabled": bool(scenario.rayleigh_enabled),
+                        "rayleigh_sigma": float(scenario.rayleigh_sigma),
+                        "env_disturbance_scale": float(scenario.env_disturbance_scale),
+                        "dynamic_obstacles": [
+                            {
+                                "position": obs.position,
+                                "radius": float(obs.radius),
+                                "velocity": obs.velocity,
+                                "speed_max": float(obs.speed_max),
+                            }
+                            for obs in dynamic_obstacles
+                        ],
+                        "static_obstacles": [
+                            {
+                                "position": obs.position,
+                                "radius": float(obs.radius),
+                            }
+                            for obs in static_obstacles
+                        ],
+                    },
+                    "vectors": {
+                        "velocity_body": physics.state.nu,
+                        "thrust_total": physics_data["thruster"]["force_vector"],
+                        "thrust_port": physics_data["thruster_pair"]["port"]["force_vector"],
+                        "thrust_starboard": physics_data["thruster_pair"]["starboard"]["force_vector"],
+                    },
+                    "metrics": {
+                        "tracking_error_m": tracking_error,
+                        "attitude_error_deg": attitude_error_deg,
+                        "min_clearance_m": float(min_clearance if np.isfinite(min_clearance) else scenario.pool_radius),
+                        "energy_score": float(energy_score),
+                        "path_length_m": float(path_length),
+                        "mean_speed_mps": _mean(speed_samples),
+                        "termination": termination.value,
+                    },
+                })
+
+        rms_tracking_error = float(np.sqrt(np.mean(np.square(error_samples)))) if error_samples else 0.0
+        mean_attitude_error_deg = _mean(attitude_error_samples_deg)
+        rms_attitude_error_deg = float(np.sqrt(np.mean(np.square(attitude_error_samples_deg)))) if attitude_error_samples_deg else 0.0
+        final_attitude_error_deg = attitude_error_samples_deg[-1] if attitude_error_samples_deg else 0.0
+        final_target = hold_position if scenario.benchmark_mode == "stability" else (waypoints[-1] if waypoints else hold_position)
+        final_error = float(np.linalg.norm(prev_pos - final_target))
         if termination == EpisodeTermination.RUNNING:
             termination = EpisodeTermination.TIMEOUT
 
-        final_target = waypoints[-1] if waypoints else np.zeros(3)
-        final_error = float(np.linalg.norm(prev_pos - final_target))
-        completion_rate, reached = self._completion(controller_name, control, hrl, len(waypoints))
+        if scenario.benchmark_mode == "stability":
+            completion_rate = 1.0 if termination == EpisodeTermination.TIMEOUT else max(0.0, steps / max(1, scenario.max_steps))
+            reached = 0
+            success = (
+                termination == EpisodeTermination.TIMEOUT
+                and final_error <= scenario.position_tolerance_m
+                and final_attitude_error_deg <= scenario.attitude_tolerance_deg
+            )
+            termination_label = "stability_complete" if success else termination.value
+        else:
+            completion_rate, reached = self._completion(controller_name, control, hrl, len(waypoints))
+            success = termination == EpisodeTermination.MISSION_COMPLETE
+            termination_label = termination.value
+
         min_clearance_value = float(min_clearance if np.isfinite(min_clearance) else scenario.pool_radius)
         score = self._score_run(
+            benchmark_mode=scenario.benchmark_mode,
             termination=termination,
+            success=success,
             completion_rate=completion_rate,
             final_error=final_error,
-            rms_error=float(np.sqrt(np.mean(np.square(error_samples)))) if error_samples else final_error,
+            rms_error=rms_tracking_error if error_samples else final_error,
+            mean_attitude_error_deg=mean_attitude_error_deg,
+            final_attitude_error_deg=final_attitude_error_deg,
             energy_score=energy_score,
             min_clearance=min_clearance_value,
             sim_time=steps * scenario.dt,
         )
 
-        return BenchmarkRunResult(
+        replay_manifest = None
+        if replay_writer is not None:
+            replay_manifest = replay_writer.close(
+                summary={
+                    "benchmark_mode": scenario.benchmark_mode,
+                    "controller": controller_name,
+                    "trial": trial_number,
+                    "termination": termination_label,
+                    "success": success,
+                    "steps": steps,
+                    "sim_time_s": steps * scenario.dt,
+                    "score": score,
+                }
+            )
+
+        run_result = BenchmarkRunResult(
+            benchmark_mode=scenario.benchmark_mode,
             controller=controller_name,
             trial=trial_number,
-            termination=termination.value,
-            success=(termination == EpisodeTermination.MISSION_COMPLETE),
+            termination=termination_label,
+            success=success,
             collision=(termination == EpisodeTermination.COLLISION),
             out_of_bounds=(termination == EpisodeTermination.OUT_OF_BOUNDS),
             completion_rate=completion_rate,
             waypoints_reached=reached,
-            total_waypoints=len(waypoints),
+            total_waypoints=(0 if scenario.benchmark_mode == "stability" else len(waypoints)),
             steps=steps,
             sim_time_s=steps * scenario.dt,
             mean_tracking_error_m=_mean(error_samples) if error_samples else final_error,
-            rms_tracking_error_m=float(np.sqrt(np.mean(np.square(error_samples)))) if error_samples else final_error,
+            rms_tracking_error_m=rms_tracking_error if error_samples else final_error,
             final_position_error_m=final_error,
+            mean_attitude_error_deg=mean_attitude_error_deg,
+            rms_attitude_error_deg=rms_attitude_error_deg,
+            final_attitude_error_deg=final_attitude_error_deg,
             min_clearance_m=min_clearance_value,
             path_length_m=path_length,
             mean_speed_mps=_mean(speed_samples),
             mean_compute_ms=_mean(compute_samples_ms),
             energy_score=energy_score,
             score=score,
+            replay_run_id=(replay_manifest.get("run_id") if replay_manifest else None),
+            replay_frames_path=(replay_manifest.get("frames_path") if replay_manifest else None),
+            replay_meta_path=(replay_manifest.get("meta_path") if replay_manifest else None),
         )
+        return run_result, replay_manifest
 
     @staticmethod
-    def _current_target(controller_name, control, hrl, waypoints):
+    def _current_target(controller_name, control, hrl, waypoints, scenario: BenchmarkScenario):
+        if scenario.benchmark_mode == "stability":
+            return np.asarray(scenario.hold_position, dtype=float)
         if controller_name == "rl":
             current = hrl.n3.current_waypoint
         else:
@@ -325,6 +506,11 @@ class ControllerBenchmark:
         if current is not None:
             return np.asarray(current, dtype=float)
         return np.asarray(waypoints[-1], dtype=float) if waypoints else None
+
+    @staticmethod
+    def _attitude_error_deg(est) -> float:
+        orientation = np.asarray(est.orientation, dtype=float)
+        return float(np.degrees(np.linalg.norm(orientation)))
 
     @staticmethod
     def _mission_complete(controller_name, control, hrl) -> bool:
@@ -354,14 +540,34 @@ class ControllerBenchmark:
 
     @staticmethod
     def _score_run(
+        benchmark_mode: str,
         termination: EpisodeTermination,
+        success: bool,
         completion_rate: float,
         final_error: float,
         rms_error: float,
+        mean_attitude_error_deg: float,
+        final_attitude_error_deg: float,
         energy_score: float,
         min_clearance: float,
         sim_time: float,
     ) -> float:
+        if benchmark_mode == "stability":
+            score = 100.0
+            if success:
+                score += 20.0
+            if termination == EpisodeTermination.COLLISION:
+                score -= 120.0
+            if termination == EpisodeTermination.OUT_OF_BOUNDS:
+                score -= 80.0
+            score -= 10.0 * final_error
+            score -= 6.0 * rms_error
+            score -= 0.7 * mean_attitude_error_deg
+            score -= 0.5 * final_attitude_error_deg
+            score -= 0.8 * energy_score
+            score += max(0.0, min(10.0, sim_time * 0.1))
+            return float(score)
+
         score = 100.0 * completion_rate
         if termination == EpisodeTermination.MISSION_COMPLETE:
             score += 40.0
@@ -385,6 +591,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Run USV controller benchmarks")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
     parser.add_argument("--output-dir", type=str, default="./training_runs")
+    parser.add_argument("--benchmark-mode", type=str, default=DEFAULT_BENCHMARK_MODE, choices=list(BENCHMARK_MODES))
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--dt", type=float, default=0.01)
@@ -396,6 +603,9 @@ def _parse_args():
     parser.add_argument("--env-disturbance-scale", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--controllers", nargs="*", default=["lqr", "mpc", "rl"])
+    parser.add_argument("--hold-position", nargs=3, metavar=("X", "Y", "Z"), type=float, default=None)
+    parser.add_argument("--position-tolerance-m", type=float, default=0.75)
+    parser.add_argument("--attitude-tolerance-deg", type=float, default=12.0)
     parser.add_argument(
         "--waypoint",
         action="append",
@@ -406,6 +616,8 @@ def _parse_args():
     )
     parser.add_argument("--waypoints-file", type=str, default=None)
     parser.add_argument("--output-file", type=str, default="benchmark_report.json")
+    parser.add_argument("--replay-dir", type=str, default="./training_runs/replays")
+    parser.add_argument("--no-replay", action="store_true")
     return parser.parse_args()
 
 
@@ -437,9 +649,17 @@ def main() -> int:
         rayleigh_sigma=float(args.rayleigh_sigma),
         env_disturbance_scale=float(args.env_disturbance_scale),
         seed=int(args.seed),
+        benchmark_mode=str(args.benchmark_mode),
+        hold_position=([float(v) for v in args.hold_position] if args.hold_position else None),
+        position_tolerance_m=float(args.position_tolerance_m),
+        attitude_tolerance_deg=float(args.attitude_tolerance_deg),
     )
 
-    benchmark = ControllerBenchmark(args.checkpoint_dir)
+    benchmark = ControllerBenchmark(
+        checkpoint_dir=args.checkpoint_dir,
+        replay_dir=args.replay_dir,
+        enable_replay_export=(not args.no_replay),
+    )
     result = benchmark.run(scenario, controllers=list(args.controllers))
 
     output_dir = Path(args.output_dir)

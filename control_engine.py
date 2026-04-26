@@ -168,6 +168,7 @@ class GuidanceGains:
     max_yaw_diff: float = 0.28
     max_theta_deg: float = 34.0
     depth_deadband_m: float = 0.18
+    heave_priority_ratio: float = 0.65
 
 
 def wrap_angle(angle: float) -> float:
@@ -252,14 +253,27 @@ def guidance_to_dual_thruster_command(
 
     depth_cmd = g.k_depth * np.tanh(depth_err / 1.5) - g.k_heave_damp * heave
     max_theta = np.radians(g.max_theta_deg)
+    depth_only_mode = horizontal_dist <= 1.0
+
     if abs(depth_err) <= g.depth_deadband_m and abs(heave) < 0.08:
         theta_depth = 0.0
     else:
         theta_depth = float(np.clip(abs(depth_cmd), 0.0, max_theta))
         phi_depth = float(np.pi / 2.0 if depth_cmd >= 0.0 else 3.0 * np.pi / 2.0)
-        if theta_depth > theta:
-            theta = theta_depth
+        if depth_only_mode:
             phi = phi_depth
+            theta = max(theta, theta_depth)
+        else:
+            # Quando o comando de profundidade domina, fixa o azimute em +/-90°
+            # para evitar descontinuidade via arctan2(cmd_z, cmd_y) perto do setpoint.
+            yz_total = abs(cmd_y) + abs(cmd_z) + 1e-9
+            heave_share = abs(cmd_z) / yz_total
+            if heave_share >= g.heave_priority_ratio:
+                phi = phi_depth
+                theta = max(theta, theta_depth)
+            elif theta_depth > theta:
+                theta = theta_depth
+                phi = phi_depth
 
     ballast = float(np.clip(
         g.k_ballast * np.tanh(depth_err / 2.0) - g.k_ballast_damp * heave,

@@ -1,541 +1,207 @@
 """
-USV Digital Twin — Servidor de Visualização
-============================================
-Flask + Flask-SocketIO — bridge Python ↔ Three.js
+USV Digital Twin — Replay Visualization Server
+==============================================
+Servidor de visualização pós-processamento.
 
-Transmite estado da simulação a 60Hz via WebSocket.
-Recebe comandos do usuário (waypoints, controlador, sliders).
+Arquitetura:
+- benchmark_engine: única fonte de verdade física
+- replay_exporter: persistência temporal
+- visualization_player: reprodução para frontend
 
-Instalar dependências:
-    pip install flask flask-socketio eventlet --break-system-packages
+Este servidor NÃO roda PhysicsEngine e NÃO integra dinâmica em runtime.
 """
 
-import numpy as np
-import threading
-import time
-import json
 import os
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
-from benchmark_engine import BenchmarkScenario, ControllerBenchmark, DEFAULT_MAX_STEPS
 from geometry_engine import GeometryEngine
-from physics_engine  import PhysicsEngine, VehicleState
-from sensor_engine   import SensorEngine, ExtendedKalmanFilter, Environment
-from control_engine  import ControlEngine
-from mpc_controller  import integrate_mpc
-from rl_controller   import integrate_rl
-from mission_engine  import MissionEngine, DynamicObstacle
+from visualization_player import PlayerLoop, VisualizationPlayer
 
 
-# ─────────────────────────────────────────────
-# CONFIGURAÇÃO
-# ─────────────────────────────────────────────
-
-app    = Flask(__name__)
+app = Flask(__name__)
 app.config['SECRET_KEY'] = 'usv_digital_twin'
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 
-# estado global da simulação
-SIM = {
-    'running':     False,
-    'paused':      False,
-    'dt':          0.01,
-    'time':        0.0,
-    'controller':  'lqr',
-    'trajectory':  [],   # últimos 500 pontos
-    'max_traj':    500,
-    'waypoints':   [],
-    'reference_frame': 'NED',
-    'rayleigh_enabled': False,
-    'rayleigh_sigma': 0.03,
-    'env_disturbance_scale': 0.0,
-    'mode':        'free',  # free | training | inference
-    'benchmark_running': False,
-    'benchmark_result': None,
-    'benchmark_status': 'idle',
-    'benchmark_history': [],
+VIEW = {
+    'replay_dir': os.path.join(os.getcwd(), 'training_runs', 'replays'),
+    'status': 'idle',
 }
 
-# componentes — inicializados no startup
-geo     = None
-physics = None
-env     = None
-sensors = None
-ekf     = None
-control = None
-hrl     = None
-dynamic_obstacles = []
-benchmark_runner = ControllerBenchmark('./checkpoints')
-BENCHMARK_HISTORY_PATH = os.path.join(os.getcwd(), 'benchmark_history.json')
-
-# trajetória e lock
-traj_lock = threading.Lock()
-physics_lock = threading.Lock()   # protege physics + control de acesso concorrente GUI/sim
+geo = GeometryEngine(L=0.8, D=0.1)
+player = VisualizationPlayer(VIEW['replay_dir'])
+player_loop = None
 
 
-def _load_benchmark_history():
-    if not os.path.exists(BENCHMARK_HISTORY_PATH):
-        return []
-    try:
-        with open(BENCHMARK_HISTORY_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+def _emit_replay_state(payload):
+    socketio.emit('state', payload)
 
 
-def _save_benchmark_history(history):
-    with open(BENCHMARK_HISTORY_PATH, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+def _safe_payload(data):
+    return data if isinstance(data, dict) else {}
 
 
-def _history_entry_from_result(result):
-    scenario = result.get('scenario', {})
-    ranking = result.get('ranking', [])
-    return {
-        'saved_at_epoch_s': time.time(),
-        'scenario': {
-            'trials': scenario.get('trials'),
-            'max_steps': scenario.get('max_steps'),
-            'dt': scenario.get('dt'),
-            'noise_scale': scenario.get('noise_scale'),
-            'rayleigh_enabled': scenario.get('rayleigh_enabled'),
-            'waypoints': scenario.get('waypoints', []),
-        },
-        'ranking': ranking,
-        'controllers': result.get('controllers', {}),
-    }
-
-
-# ─────────────────────────────────────────────
-# INICIALIZAÇÃO
-# ─────────────────────────────────────────────
-
-def init_simulation():
-    global geo, physics, env, sensors, ekf, control, hrl
-
-    geo     = GeometryEngine(L=0.8, D=0.1)
-    physics = PhysicsEngine(geo, max_thruster_force=10.0)
-    env     = Environment(pool_depth=10.0, pool_radius=30.0)
-    sensors = SensorEngine(
-      env,
-      noise_scale=0.5,
-      rayleigh_sigma=SIM['rayleigh_sigma'],
-      enable_rayleigh=SIM['rayleigh_enabled'],
-      seed=42,
-    )
-    sensors.set_environmental_disturbance(
-      enabled=SIM['rayleigh_enabled'],
-      scale=SIM['env_disturbance_scale'],
-      rayleigh_sigma=SIM['rayleigh_sigma'],
-    )
-    ekf     = ExtendedKalmanFilter(physics)
-    control = ControlEngine(physics, hover_depth=5.0)
-
-    integrate_mpc(control, hover_depth=5.0)
-    hrl = integrate_rl(control, './checkpoints')
-    SIM['benchmark_history'] = _load_benchmark_history()
-
-    # waypoint inicial
-    SIM['waypoints'] = [[5.0, 0.0, 5.0]]
-    default_waypoint = np.array([5.0, 0.0, 5.0], dtype=float)
-    control.set_waypoints([default_waypoint])
-    hrl.set_waypoints([default_waypoint])
-
-    print("✓ Simulação inicializada")
-
-
-# ─────────────────────────────────────────────
-# LOOP DE SIMULAÇÃO (thread separada)
-# ─────────────────────────────────────────────
-
-def simulation_loop():
-    global dynamic_obstacles
-
-    last_emit = time.time()
-    emit_interval = 1.0 / 60.0   # 60Hz
-    rng = np.random.default_rng(42)
-
-    while True:
-        if not SIM['running'] or SIM['paused']:
-            time.sleep(0.01)
-            continue
-
-        dt = SIM['dt']
-
-        # atualiza obstáculos dinâmicos
-        for dyn in dynamic_obstacles:
-            dyn.step(dt, rng)
-            # atualiza posição no ambiente
-        _sync_dynamic_obstacles()
-
-        # sensoriamento
-        bundle = sensors.read(physics.state, SIM['time'])
-
-        # EKF
-        ekf.predict(dt)
-        ekf.update_imu(bundle.imu)
-        ekf.update_barometer(bundle.barometer)
-        ekf.update_sonar(bundle.sonar)
-        est = ekf.state_estimate
-
-        # controle + física — protegido contra acesso concorrente da GUI
-        with physics_lock:
-            ctrl = SIM['controller']
-            if ctrl == 'lqr':
-                cmd = control.compute(est, SIM['time'])
-            elif ctrl == 'mpc':
-                cmd = control.compute(est, SIM['time'])
-            elif ctrl == 'rl':
-                cmd = hrl.compute(
-                    est, bundle.imu, bundle.sonar,
-                  dt, training=False
-                )
-            else:
-                from control_engine import ControlCommand
-                cmd = ControlCommand(0, 0, 0, 0)
-
-            physics.step(
-                thruster_power=cmd.thruster_power,
-                thruster_theta=cmd.thruster_theta,
-                thruster_phi=cmd.thruster_phi,
-                ballast_cmd=cmd.ballast_cmd,
-              thruster2_power=cmd.thruster2_power,
-              thruster2_theta=cmd.thruster2_theta,
-              thruster2_phi=cmd.thruster2_phi,
-                dt=dt,
-            )
-
-        SIM['time'] += dt
-
-        # trajetória
-        pos = [physics.state.x, physics.state.y, physics.state.z]
-        with traj_lock:
-            SIM['trajectory'].append(pos)
-            if len(SIM['trajectory']) > SIM['max_traj']:
-                SIM['trajectory'].pop(0)
-
-        # emite estado ao browser a 60Hz
-        now = time.time()
-        if now - last_emit >= emit_interval:
-            last_emit = now
-            _emit_state(bundle, est, cmd)
-
-
-def _sync_dynamic_obstacles():
-    """Sincroniza obstáculos dinâmicos no ambiente."""
-    n_static = len(env.obstacles) - len(dynamic_obstacles)
-    env.obstacles = env.obstacles[:max(2, n_static)]
-    for dyn in dynamic_obstacles:
-        env.obstacles.append(dyn.to_obstacle())
-
-
-def _emit_state(bundle, est, cmd):
-    """Serializa e emite estado completo via WebSocket."""
-    s = physics.state
-    d = physics.to_dict()
-
-    # sonar rays
-    sonar_data = []
-    for ray in bundle.sonar:
-        sonar_data.append({
-            'direction': ray.direction.tolist(),
-            'distance':  ray.distance,
-            'hit':       ray.hit,
-            'confidence': ray.confidence,
+def _catalog_payload():
+    trials = player.list_trials()
+    history = []
+    for item in trials:
+        history.append({
+            'saved_at_epoch_s': 0,
+            'label': item['run_id'],
+            'benchmark_mode': item['benchmark_mode'],
+            'scenario': {
+                'trials': item['trial'],
+                'max_steps': item['frame_count'],
+                'dt': None,
+            },
+            'controllers': {
+                item['controller']: {
+                    'score': 0.0,
+                    'success_rate': 0.0,
+                    'collision_rate': 0.0,
+                    'mean_tracking_error_m': 0.0,
+                    'mean_final_error_m': 0.0,
+                    'mean_attitude_error_deg': 0.0,
+                    'mean_final_attitude_error_deg': 0.0,
+                    'mean_time_s': item['duration_s'],
+                    'mean_energy_score': 0.0,
+                    'mean_compute_ms': 0.0,
+                }
+            },
+            'replay': item,
         })
-
-    # obstáculos dinâmicos
-    dyn_obs_data = [
-        {'position': dyn.position.tolist(), 'radius': dyn.radius}
-        for dyn in dynamic_obstacles
-    ]
-
-    state_data = {
-        'time':     SIM['time'],
-        'position': [s.x, s.y, s.z],
-        'quaternion': [s.qw, s.qx, s.qy, s.qz],
-        'velocity_linear':  [s.u, s.v, s.w],
-        'velocity_angular': [s.p, s.q, s.r],
-        'euler': [s.phi, s.tht, s.psi],
-        'ballast': d['ballast'],
-        'thruster': d['thruster'],
-        'sonar':   sonar_data,
-        'ekf': {
-            'position':    est.eta[:3].tolist(),
-            'orientation': est.eta[3:].tolist(),
-        },
-        'trajectory':        SIM['trajectory'][-50:],   # últimos 50 pontos
-        'waypoints':         SIM['waypoints'],
-        'reference_frame':   SIM['reference_frame'],
-        'environmental_noise': {
-          'rayleigh_enabled': SIM['rayleigh_enabled'],
-          'rayleigh_sigma': SIM['rayleigh_sigma'],
-          'env_disturbance_scale': SIM['env_disturbance_scale'],
-        },
-        'dynamic_obstacles': dyn_obs_data,
-        'controller':        SIM['controller'],
-        'controller_waypoint': None if control.current_waypoint is None else control.current_waypoint.tolist(),
-        'controller_waypoint_index': control.waypoint_index,
-        'controller_waypoint_count': control.waypoint_count,
-        'controller_mission_complete': control.mission_complete,
-        'command': cmd.to_dict(),
+    return {
+        'trials': trials,
+        'history': history,
     }
 
-    socketio.emit('state', state_data)
 
-
-def _build_benchmark_scenario(config=None):
-    """Captura o cenário atual da GUI para benchmark reproduzível."""
-    config = config or {}
-    with physics_lock:
-        waypoints = SIM['waypoints'][:] if SIM['waypoints'] else [[5.0, 0.0, 5.0]]
-        dyn_obs = [
-            {
-                'position': dyn.position.tolist(),
-                'radius': dyn.radius,
-                'velocity': dyn.velocity.tolist(),
-                'speed_max': dyn.speed_max,
-                'bounds_min': dyn.bounds_min.tolist(),
-                'bounds_max': dyn.bounds_max.tolist(),
-            }
-            for dyn in dynamic_obstacles
-        ]
-        scenario = BenchmarkScenario(
-            waypoints=[[float(v) for v in wp] for wp in waypoints],
-            static_obstacles=[],
-            dynamic_obstacles=dyn_obs,
-            dt=float(config.get('dt', SIM['dt'])),
-          max_steps=int(config.get('max_steps', DEFAULT_MAX_STEPS)),
-            trials=int(config.get('trials', 3)),
-            pool_depth=10.0,
-            pool_radius=30.0,
-            noise_scale=float(config.get('noise_scale', sensors.noise_scale)),
-            rayleigh_enabled=bool(config.get('rayleigh_enabled', SIM['rayleigh_enabled'])),
-            rayleigh_sigma=float(config.get('rayleigh_sigma', SIM['rayleigh_sigma'])),
-            env_disturbance_scale=float(config.get('env_disturbance_scale', SIM['env_disturbance_scale'])),
-            seed=int(config.get('seed', 42)),
-        )
-    return scenario
-
-
-def _benchmark_worker(scenario, controllers):
-    try:
-        SIM['benchmark_status'] = 'running'
-        result = benchmark_runner.run(
-            scenario,
-            controllers=controllers,
-            progress_callback=lambda payload: socketio.emit('benchmark_progress', payload),
-        )
-        SIM['benchmark_result'] = result
-        history = SIM.get('benchmark_history', [])
-        history.append(_history_entry_from_result(result))
-        SIM['benchmark_history'] = history
-        _save_benchmark_history(history)
-        SIM['benchmark_status'] = 'completed'
-        socketio.emit('benchmark_complete', result)
-        socketio.emit('benchmark_history', {'history': SIM['benchmark_history']})
-    except Exception as exc:
-        SIM['benchmark_status'] = 'error'
-        socketio.emit('benchmark_error', {'message': str(exc)})
-    finally:
-        SIM['benchmark_running'] = False
-
-
-# ─────────────────────────────────────────────
-# EVENTOS WEBSOCKET
-# ─────────────────────────────────────────────
-
-@socketio.on('connect')
-def on_connect():
-    print(f"Cliente conectado")
-    emit('ready', {'mesh': geo.to_dict()['mesh']})
-    emit('benchmark_status', {
-        'status': SIM['benchmark_status'],
-        'running': SIM['benchmark_running'],
-    })
-    if SIM['benchmark_result'] is not None:
-        emit('benchmark_complete', SIM['benchmark_result'])
-    emit('benchmark_history', {'history': SIM.get('benchmark_history', [])})
-
-
-@socketio.on('start')
-def on_start():
-    SIM['running'] = True
-    SIM['paused']  = False
-    emit('status', {'running': True})
-
-
-@socketio.on('pause')
-def on_pause():
-    SIM['paused'] = not SIM['paused']
-    emit('status', {'paused': SIM['paused']})
-
-
-@socketio.on('reset')
-def on_reset():
-  SIM['time'] = 0.0
-  initial_state = VehicleState(z=5.0)
-  physics.reset(initial_state)
-  ekf.reset(np.concatenate([initial_state.eta, initial_state.nu]))
-  waypoints = [np.array(wp, dtype=float) for wp in SIM['waypoints']] or [np.array([5.0, 0.0, 5.0], dtype=float)]
-  control.set_waypoints([wp.copy() for wp in waypoints])
-  hrl.set_waypoints([wp.copy() for wp in waypoints])
-  with traj_lock:
-    SIM['trajectory'].clear()
-  emit('status', {'reset': True})
-
-
-@socketio.on('set_controller')
-def on_set_controller(data):
-    ctrl = data.get('controller', 'lqr')
-    if ctrl in ['lqr', 'mpc', 'rl']:
-        if ctrl in ['lqr', 'mpc']:
-            with physics_lock:
-                control.set_controller(ctrl)
-        SIM['controller'] = ctrl
-        emit('status', {'controller': ctrl})
-
-
-@socketio.on('set_waypoint')
-def on_set_waypoint(data):
-    """Recebe waypoint clicado na cena 3D."""
-    wp = data.get('position', [5, 0, 5])
-    SIM['waypoints'] = [wp]
-    control.set_waypoints([np.array(wp, dtype=float)])
-    hrl.set_waypoints([np.array(wp)])
-    emit('status', {'waypoint_set': wp})
-
-
-@socketio.on('add_waypoint')
-def on_add_waypoint(data):
-    """Adiciona waypoint à sequência."""
-    wp = data.get('position', [5, 0, 5])
-    SIM['waypoints'].append(wp)
-    control.set_waypoints([np.array(w, dtype=float) for w in SIM['waypoints']])
-    hrl.set_waypoints([np.array(w) for w in SIM['waypoints'][:5]])
-    emit('status', {'waypoints': SIM['waypoints']})
-
-@socketio.on('set_waypoints')
-def on_set_waypoints(data):
-    """
-    Define lista completa de waypoints em coordenadas NED locais.
-    Formato esperado:
-      {"waypoints": [[x_north, y_east, z_down], ...]}
-    """
-    waypoints = data.get('waypoints', [])
-    if not isinstance(waypoints, list) or len(waypoints) == 0:
-        emit('status', {'error': 'waypoints inválidos'})
+def _initial_load_latest():
+    catalog = player.list_trials()
+    if not catalog:
+        VIEW['status'] = 'empty'
         return
+    latest = catalog[-1]['run_id']
+    if player.load_primary(latest):
+        player.select_trials([latest])
+        VIEW['status'] = 'ready'
 
-    parsed = []
-    for wp in waypoints[:5]:
-        if not isinstance(wp, (list, tuple)) or len(wp) != 3:
-            continue
-        parsed.append([float(wp[0]), float(wp[1]), float(wp[2])])
-
-    if not parsed:
-        emit('status', {'error': 'nenhum waypoint válido'})
-        return
-
-    SIM['waypoints'] = parsed
-    control.set_waypoints([np.array(w, dtype=float) for w in parsed])
-    hrl.set_waypoints([np.array(w, dtype=float) for w in parsed])
-
-    emit('status', {
-        'waypoints': SIM['waypoints'],
-        'reference_frame': SIM['reference_frame'],
-    })
-
-
-@socketio.on('update_lqr_weights')
-def on_update_weights(data):
-    """Atualiza pesos Q/R do LQR via sliders."""
-    with physics_lock:   # espera o loop de sim terminar o step atual
-        control.update_lqr_weights(**data)
-    emit('status', {'weights_updated': True})
-
-
-@socketio.on('add_obstacle')
-def on_add_obstacle(data):
-    """Adiciona obstáculo dinâmico na posição clicada."""
-    pos  = np.array(data.get('position', [5, 0, 5]))
-    rad  = data.get('radius', 0.5)
-    dyn  = DynamicObstacle(position=pos, radius=rad)
-    dynamic_obstacles.append(dyn)
-    emit('status', {'obstacles': len(dynamic_obstacles)})
-
-
-@socketio.on('clear_obstacles')
-def on_clear_obstacles():
-    dynamic_obstacles.clear()
-    _sync_dynamic_obstacles()
-    emit('status', {'obstacles': 0})
-
-
-@socketio.on('noise_scale')
-def on_noise_scale(data):
-    scale = float(data.get('scale', 1.0))
-    sensors.set_noise_scale(scale)
-    emit('status', {'noise_scale': scale})
-
-
-@socketio.on('environmental_disturbance')
-def on_environmental_disturbance(data):
-  """Configura perturbação ambiental Rayleigh em runtime."""
-  enabled = bool(data.get('enabled', True))
-  sigma = float(data.get('rayleigh_sigma', SIM['rayleigh_sigma']))
-  scale = float(data.get('scale', SIM['env_disturbance_scale']))
-
-  SIM['rayleigh_enabled'] = enabled
-  SIM['rayleigh_sigma'] = max(0.0, sigma)
-  SIM['env_disturbance_scale'] = max(0.0, scale)
-
-  sensors.set_environmental_disturbance(
-    enabled=SIM['rayleigh_enabled'],
-    scale=SIM['env_disturbance_scale'],
-    rayleigh_sigma=SIM['rayleigh_sigma'],
-  )
-
-  emit('status', {
-    'rayleigh_enabled': SIM['rayleigh_enabled'],
-    'rayleigh_sigma': SIM['rayleigh_sigma'],
-    'env_disturbance_scale': SIM['env_disturbance_scale'],
-  })
-
-
-@socketio.on('run_benchmark')
-def on_run_benchmark(data):
-    if SIM['benchmark_running']:
-        emit('benchmark_error', {'message': 'Benchmark já está em execução.'})
-        return
-
-    config = data or {}
-    scenario = _build_benchmark_scenario(config)
-    controllers = config.get('controllers', ['lqr', 'mpc', 'rl'])
-    controllers = [c for c in controllers if c in ['lqr', 'mpc', 'rl']]
-    if not controllers:
-        emit('benchmark_error', {'message': 'Nenhum controlador válido selecionado.'})
-        return
-
-    SIM['benchmark_running'] = True
-    SIM['benchmark_status'] = 'queued'
-    emit('benchmark_status', {
-        'status': 'queued',
-        'running': True,
-        'scenario': scenario.waypoints,
-    }, broadcast=True)
-    socketio.start_background_task(_benchmark_worker, scenario, controllers)
-
-
-# ─────────────────────────────────────────────
-# ROTA PRINCIPAL — serve o HTML
-# ─────────────────────────────────────────────
 
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@socketio.on('connect')
+def on_connect():
+    emit('ready', {'mesh': geo.to_dict()['mesh']})
+    emit('benchmark_status', {
+        'status': VIEW['status'],
+        'running': False,
+    })
+    payload = _catalog_payload()
+    emit('replay_catalog', payload)
+    emit('benchmark_history', {'history': payload['history']})
+    emit('replay_status', player.status())
+
+
+@socketio.on('start')
+def on_start():
+    player.play()
+    emit('status', {'running': True, 'mode': 'replay'})
+
+
+@socketio.on('pause')
+def on_pause():
+    playing = player.toggle_pause()
+    emit('status', {'paused': (not playing), 'mode': 'replay'})
+
+
+@socketio.on('reset')
+def on_reset():
+    player.reset()
+    emit('status', {'reset': True, 'mode': 'replay'})
+
+
+@socketio.on('set_replay_speed')
+def on_set_replay_speed(data):
+    payload = _safe_payload(data)
+    speed = player.set_speed(payload.get('speed', 1.0))
+    emit('replay_status', player.status())
+    emit('status', {'replay_speed': speed})
+
+
+@socketio.on('seek_replay')
+def on_seek_replay(data):
+    payload = _safe_payload(data)
+    if 'ratio' in payload:
+        playhead = player.seek_ratio(float(payload.get('ratio', 0.0)))
+    else:
+        playhead = player.seek_time(float(payload.get('time_s', 0.0)))
+    emit('replay_status', player.status())
+    emit('status', {'replay_seek_s': playhead})
+
+
+@socketio.on('load_replay')
+def on_load_replay(data):
+    payload = _safe_payload(data)
+    run_id = str(payload.get('run_id', '')).strip()
+    if not run_id:
+        emit('benchmark_error', {'message': 'run_id inválido para replay.'})
+        return
+    if not player.load_primary(run_id):
+        emit('benchmark_error', {'message': f'Replay não encontrado: {run_id}'})
+        return
+    player.select_trials([run_id])
+    emit('replay_status', player.status())
+    emit('status', {'replay_loaded': run_id})
+
+
+@socketio.on('select_replay_trials')
+def on_select_replay_trials(data):
+    payload = _safe_payload(data)
+    run_ids = payload.get('run_ids', [])
+    if not isinstance(run_ids, list):
+        run_ids = []
+    selected = player.select_trials([str(rid) for rid in run_ids])
+    emit('replay_status', player.status())
+    emit('status', {'selected_replay_trials': selected})
+
+
+@socketio.on('refresh_replays')
+def on_refresh_replays():
+    player.refresh_catalog()
+    payload = _catalog_payload()
+    emit('replay_catalog', payload)
+    emit('benchmark_history', {'history': payload['history']})
+    emit('replay_status', player.status())
+
+
+@socketio.on('run_benchmark')
+def on_run_benchmark(_data):
+    player.refresh_catalog()
+    payload = _catalog_payload()
+    emit('benchmark_error', {
+        'message': 'Benchmark em runtime foi desativado no visualization_server. Execute benchmark_engine para gerar novos replays.'
+    })
+    emit('replay_catalog', payload)
+    emit('benchmark_history', {'history': payload['history']})
+
+
+@socketio.on('set_controller')
+@socketio.on('set_waypoint')
+@socketio.on('add_waypoint')
+@socketio.on('set_waypoints')
+@socketio.on('update_lqr_weights')
+@socketio.on('add_obstacle')
+@socketio.on('clear_obstacles')
+@socketio.on('noise_scale')
+@socketio.on('environmental_disturbance')
+def on_mutation_blocked(*_args, **_kwargs):
+    emit('status', {
+        'warning': 'Mutação de dinâmica está desativada no replay viewer.',
+        'mode': 'replay',
+    })
 
 
 # ─────────────────────────────────────────────
@@ -1023,26 +689,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <button class="btn danger-btn" onclick="clearWaypoints()">Clear</button>
     </div>
 
-    <div class="panel-title" style="margin-top:12px">Benchmark</div>
-    <div class="benchmark-status" id="benchmark-status">Pronto para comparar LQR, MPC e RL no cenário atual.</div>
-
-    <div class="slider-group">
-      <div class="slider-label"><span>Trials</span><span id="bench-trials-val">3</span></div>
-      <input type="range" min="1" max="10" value="3" id="bench-trials"
-             oninput="document.getElementById('bench-trials-val').textContent = this.value">
-    </div>
-
-    <div class="slider-group">
-      <div class="slider-label"><span>Max Steps</span><span id="bench-steps-val">2000</span></div>
-      <input type="range" min="500" max="5000" step="250" value="2000" id="bench-steps"
-             oninput="document.getElementById('bench-steps-val').textContent = this.value">
-    </div>
+    <div class="panel-title" style="margin-top:12px">Replay</div>
+    <div class="benchmark-status" id="benchmark-status">Carregue um replay gerado pelo benchmark_engine.</div>
 
     <div class="btn-group">
-      <button class="btn" id="btn-benchmark" onclick="runBenchmark()">Run Benchmark</button>
+      <button class="btn" id="btn-refresh-replays" onclick="refreshReplays()">Refresh Logs</button>
     </div>
+
+    <div class="slider-group">
+      <div class="slider-label"><span>Trial</span><span id="replay-run-label">none</span></div>
+      <select id="replay-run-select" class="mini-input" onchange="loadSelectedReplay()"></select>
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-label"><span>Timeline</span><span id="replay-time">0.0 / 0.0 s</span></div>
+      <input type="range" min="0" max="1000" value="0" id="replay-scrub" oninput="seekReplay(this.value)">
+    </div>
+
+    <div class="panel-title" style="margin-top:10px">Playback Speed</div>
+    <div class="btn-group">
+      <button class="btn active" id="spd-1x" onclick="setReplaySpeed(1)">1x</button>
+      <button class="btn" id="spd-2x" onclick="setReplaySpeed(2)">2x</button>
+      <button class="btn" id="spd-5x" onclick="setReplaySpeed(5)">5x</button>
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-label"><span>Compare Trials</span><span id="selected-trials-count">1</span></div>
+      <select id="replay-compare-select" class="mini-input" multiple size="4" onchange="selectReplayTrials()"></select>
+    </div>
+
     <div class="benchmark-board" id="benchmark-results"></div>
-    <div class="benchmark-status" style="margin-top:10px">Histórico de benchmarks para comparação</div>
+    <div class="benchmark-status" style="margin-top:10px">Replay catalog</div>
     <div class="benchmark-board" id="benchmark-history"></div>
   </div>
 
@@ -1189,6 +866,8 @@ scene.add(new THREE.Points(particleGeo, particleMat));
 // ─── Modelo do veículo USV ────────────────────────────────────
 let vehicleMesh = null;
 let thrusterArrow = null;
+let velocityArrow = null;
+let envelopeMesh = null;
 let vehicleLight  = null;
 
 function buildVehicleMesh(meshParams) {
@@ -1239,6 +918,22 @@ function buildVehicleMesh(meshParams) {
   const arrowDir = new THREE.Vector3(1, 0, 0);
   thrusterArrow = new THREE.ArrowHelper(arrowDir, new THREE.Vector3(0, 0, 0), 0.3, 0xff6b35, 0.1, 0.06);
   group.add(thrusterArrow);
+
+  // vetor de velocidade (body frame projetado no mundo)
+  velocityArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 0), 0.2, 0x00a8ff, 0.08, 0.05);
+  group.add(velocityArrow);
+
+  // envelope de Monte Carlo/comparação entre trials
+  const envGeo = new THREE.BoxGeometry(1, 1, 1);
+  const envMat = new THREE.MeshBasicMaterial({
+    color: 0x00ffc8,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.25,
+  });
+  envelopeMesh = new THREE.Mesh(envGeo, envMat);
+  envelopeMesh.visible = false;
+  scene.add(envelopeMesh);
 
   return group;
 }
@@ -1383,6 +1078,14 @@ socket.on('state', data => {
   lastState = data;
   updateHUD(data);
   updateScene(data);
+  if (data?.replay) {
+    const duration = Number(data.replay.duration_s || 0);
+    const playhead = Number(data.replay.playhead_s || data.time || 0);
+    const ratio = duration > 0 ? Math.max(0, Math.min(1, playhead / duration)) : 0;
+    document.getElementById('replay-scrub').value = String(Math.round(ratio * 1000));
+    document.getElementById('replay-time').textContent = `${playhead.toFixed(1)} / ${duration.toFixed(1)} s`;
+    document.getElementById('replay-run-label').textContent = String(data.replay.run_id || 'none');
+  }
 });
 
 socket.on('status', data => {
@@ -1397,24 +1100,20 @@ socket.on('status', data => {
 });
 
 socket.on('benchmark_status', data => {
-  const running = !!data.running;
+  const status = String(data?.status || 'idle');
   document.getElementById('benchmark-status').textContent =
-    running ? 'Benchmark na fila...' : 'Benchmark pronto para execução.';
-  document.getElementById('btn-benchmark').disabled = running;
+    status === 'empty'
+      ? 'Nenhum replay encontrado. Execute benchmark_engine para gerar logs.'
+      : 'Replay viewer pronto.';
 });
 
 socket.on('benchmark_progress', data => {
-  const pct = Math.round((data.progress || 0) * 100);
-  document.getElementById('benchmark-status').textContent =
-    `Executando ${data.controller.toUpperCase()} | rodada ${data.trial}/${data.trials} | ${pct}%`;
-  document.getElementById('btn-benchmark').disabled = true;
+  if (!data) return;
+  document.getElementById('benchmark-status').textContent = String(data.message || 'Atualizando replay...');
 });
 
 socket.on('benchmark_complete', data => {
   benchmarkData = data;
-  document.getElementById('benchmark-status').textContent =
-    `Benchmark concluído com ${data.scenario.trials} rodada(s).`;
-  document.getElementById('btn-benchmark').disabled = false;
   renderBenchmark(data);
 });
 
@@ -1425,37 +1124,163 @@ socket.on('benchmark_history', data => {
 
 socket.on('benchmark_error', data => {
   document.getElementById('benchmark-status').textContent =
-    `Erro no benchmark: ${data.message}`;
-  document.getElementById('btn-benchmark').disabled = false;
+    String(data?.message || 'Erro no replay viewer.');
 });
 
-function runBenchmark() {
-  document.getElementById('benchmark-status').textContent = 'Preparando benchmark...';
-  document.getElementById('btn-benchmark').disabled = true;
-  socket.emit('run_benchmark', {
-    trials: Number(document.getElementById('bench-trials').value),
-    max_steps: Number(document.getElementById('bench-steps').value),
+socket.on('replay_catalog', data => {
+  const trials = Array.isArray(data?.trials) ? data.trials : [];
+  updateReplaySelects(trials);
+  document.getElementById('benchmark-status').textContent =
+    trials.length ? `Replays disponíveis: ${trials.length}` : 'Nenhum replay disponível.';
+});
+
+socket.on('replay_status', data => {
+  const replay = data || {};
+  const duration = Number(replay.duration_s || 0);
+  const playhead = Number(replay.playhead_s || 0);
+  const ratio = duration > 0 ? Math.max(0, Math.min(1, playhead / duration)) : 0;
+  document.getElementById('replay-scrub').value = String(Math.round(ratio * 1000));
+  document.getElementById('replay-time').textContent = `${playhead.toFixed(1)} / ${duration.toFixed(1)} s`;
+  document.getElementById('replay-run-label').textContent = String(replay.primary_run_id || 'none');
+  const selected = Array.isArray(replay.selected_run_ids) ? replay.selected_run_ids : [];
+  document.getElementById('selected-trials-count').textContent = String(selected.length || 0);
+});
+
+function refreshReplays() {
+  socket.emit('refresh_replays');
+}
+
+function loadSelectedReplay() {
+  const sel = document.getElementById('replay-run-select');
+  const runId = String(sel.value || '');
+  if (!runId) return;
+  socket.emit('load_replay', { run_id: runId });
+}
+
+function setReplaySpeed(speed) {
+  socket.emit('set_replay_speed', { speed });
+  [1,2,5].forEach(v => {
+    const btn = document.getElementById(`spd-${v}x`);
+    if (btn) btn.classList.toggle('active', Number(v) === Number(speed));
   });
+}
+
+function seekReplay(sliderValue) {
+  const ratio = Number(sliderValue) / 1000;
+  socket.emit('seek_replay', { ratio });
+}
+
+function selectReplayTrials() {
+  const sel = document.getElementById('replay-compare-select');
+  const runIds = Array.from(sel.selectedOptions).map(opt => opt.value);
+  socket.emit('select_replay_trials', { run_ids: runIds });
+}
+
+function updateReplaySelects(trials) {
+  const primary = document.getElementById('replay-run-select');
+  const compare = document.getElementById('replay-compare-select');
+  primary.innerHTML = '';
+  compare.innerHTML = '';
+  trials.forEach(t => {
+    const label = `${String(t.controller || 'ctrl').toUpperCase()} T${Number(t.trial || 0)} | ${String(t.run_id)}`;
+    const o1 = document.createElement('option');
+    o1.value = String(t.run_id || '');
+    o1.textContent = label;
+    primary.appendChild(o1);
+
+    const o2 = document.createElement('option');
+    o2.value = String(t.run_id || '');
+    o2.textContent = label;
+    compare.appendChild(o2);
+  });
+}
+
+function _normalizeBenchmarkCategories(data) {
+  if (data?.categories && typeof data.categories === 'object') {
+    return data.categories;
+  }
+  return { benchmark: data || {} };
+}
+
+function _normalizeBenchmarkRanking(data) {
+  if (Array.isArray(data?.ranking)) {
+    return data.ranking;
+  }
+  if (data?.controllers && typeof data.controllers === 'object') {
+    return Object.entries(data.controllers).map(([controller, metrics]) => ({
+      controller,
+      ...(metrics || {}),
+    }));
+  }
+  return [];
+}
+
+function _formatBenchmarkItem(item) {
+  return {
+    controller: String(item.controller || 'unknown'),
+    score: Number(item.score || 0),
+    success_rate: Number(item.success_rate || 0),
+    collision_rate: Number(item.collision_rate || 0),
+    mean_tracking_error_m: Number(item.mean_tracking_error_m || 0),
+    mean_final_error_m: Number(item.mean_final_error_m || 0),
+    mean_attitude_error_deg: Number(item.mean_attitude_error_deg || 0),
+    mean_final_attitude_error_deg: Number(item.mean_final_attitude_error_deg || 0),
+    mean_time_s: Number(item.mean_time_s || 0),
+    mean_energy_score: Number(item.mean_energy_score || 0),
+    mean_compute_ms: Number(item.mean_compute_ms || 0),
+  };
+}
+
+function _renderBenchmarkCards(title, payload) {
+  const ranking = _normalizeBenchmarkRanking(payload).map(_formatBenchmarkItem);
+  const scenario = payload?.scenario || {};
+  if (!ranking.length) {
+    return `
+      <div class="benchmark-card">
+        <strong>${title}</strong>
+        <div class="meta">Sem dados nesta categoria.</div>
+      </div>
+    `;
+  }
+
+  const modeTag = scenario.benchmark_mode ? `modo ${String(scenario.benchmark_mode).toUpperCase()}` : '';
+  const targetTag = Array.isArray(scenario.waypoints) && scenario.waypoints.length
+    ? `waypoints ${scenario.waypoints.length}`
+    : `hold ${Array.isArray(scenario.hold_position) ? scenario.hold_position.map(v => Number(v).toFixed(1)).join(', ') : 'n/a'}`;
+
+  return `
+    <div class="benchmark-card">
+      <strong>${title}</strong>
+      <div class="meta">
+        ${modeTag} | trials ${scenario.trials ?? '—'} | ${targetTag}
+      </div>
+    </div>
+    ${ranking.map((item, index) => `
+      <div class="benchmark-card">
+        <strong>#${index + 1} ${item.controller.toUpperCase()}</strong>
+        <div class="meta">
+          score ${item.score.toFixed(1)} | sucesso ${(item.success_rate * 100).toFixed(0)}% | colisão ${(item.collision_rate * 100).toFixed(0)}%<br>
+          erro médio ${item.mean_tracking_error_m.toFixed(2)} m | erro final ${item.mean_final_error_m.toFixed(2)} m<br>
+          atitude média ${item.mean_attitude_error_deg.toFixed(1)}° | atitude final ${item.mean_final_attitude_error_deg.toFixed(1)}°<br>
+          tempo ${item.mean_time_s.toFixed(1)} s | energia ${item.mean_energy_score.toFixed(2)} | CPU ${item.mean_compute_ms.toFixed(2)} ms
+        </div>
+      </div>
+    `).join('')}
+  `;
 }
 
 function renderBenchmark(data) {
   const root = document.getElementById('benchmark-results');
-  const ranking = data.ranking || [];
-  if (!ranking.length) {
+  const categories = _normalizeBenchmarkCategories(data);
+  const categoryNames = Object.keys(categories);
+  if (!categoryNames.length) {
     root.innerHTML = '<div class="benchmark-card"><div class="meta">Sem dados de benchmark.</div></div>';
     return;
   }
 
-  root.innerHTML = ranking.map((item, index) => `
-    <div class="benchmark-card">
-      <strong>#${index + 1} ${item.controller.toUpperCase()}</strong>
-      <div class="meta">
-        score ${item.score.toFixed(1)} | sucesso ${(item.success_rate * 100).toFixed(0)}% | colisão ${(item.collision_rate * 100).toFixed(0)}%<br>
-        erro médio ${item.mean_tracking_error_m.toFixed(2)} m | erro final ${item.mean_final_error_m.toFixed(2)} m<br>
-        tempo ${item.mean_time_s.toFixed(1)} s | energia ${item.mean_energy_score.toFixed(2)} | CPU ${item.mean_compute_ms.toFixed(2)} ms
-      </div>
-    </div>
-  `).join('');
+  root.innerHTML = categoryNames.map(name =>
+    _renderBenchmarkCards(name.toUpperCase(), categories[name])
+  ).join('');
 }
 
 function renderBenchmarkHistory(history) {
@@ -1469,19 +1294,22 @@ function renderBenchmarkHistory(history) {
   root.innerHTML = items.map((entry, idx) => {
     const when = new Date((entry.saved_at_epoch_s || 0) * 1000);
     const whenText = Number.isNaN(when.getTime()) ? 'sem data' : when.toLocaleString();
-    const scenario = entry.scenario || {};
     const label = entry.label ? String(entry.label) : null;
-    const ranking = Array.isArray(entry.ranking) ? entry.ranking : [];
-    const summary = ranking.map(item =>
-      `${item.controller.toUpperCase()}: score ${item.score.toFixed(1)}, sucesso ${(item.success_rate * 100).toFixed(0)}%, colisão ${(item.collision_rate * 100).toFixed(0)}%`
-    ).join('<br>');
+    const categories = _normalizeBenchmarkCategories(entry);
+    const summary = Object.entries(categories).map(([name, payload]) => {
+      const scenario = payload?.scenario || {};
+      const ranking = _normalizeBenchmarkRanking(payload).map(_formatBenchmarkItem);
+      const rankingText = ranking.map(item =>
+        `${item.controller.toUpperCase()}: score ${item.score.toFixed(1)}, sucesso ${(item.success_rate * 100).toFixed(0)}%, colisão ${(item.collision_rate * 100).toFixed(0)}%`
+      ).join('<br>');
+      const scenarioText = `trials ${scenario.trials ?? '—'} | max_steps ${scenario.max_steps ?? '—'} | dt ${scenario.dt ?? '—'}`;
+      return `<strong>${String(name).toUpperCase()}</strong><br>${scenarioText}<br>${rankingText || 'Sem ranking salvo.'}`;
+    }).join('<br><br>');
     return `
       <div class="benchmark-card">
         <strong>${label ? label.toUpperCase() : `LOG #${history.length - idx}`}</strong>
         <div class="meta">
           ${whenText}<br>
-          trials ${scenario.trials ?? '—'} | max_steps ${scenario.max_steps ?? '—'} | dt ${scenario.dt ?? '—'}<br>
-          waypoints ${Array.isArray(scenario.waypoints) ? scenario.waypoints.length : 0}<br>
           ${summary || 'Sem ranking salvo.'}
         </div>
       </div>
@@ -1522,6 +1350,18 @@ function updateScene(data) {
   if (vehicleLight) {
     const p = Math.abs(data.thruster.power);
     vehicleLight.intensity = 0.5 + p * 2.0;
+  }
+
+  // vetor de velocidade
+  if (velocityArrow) {
+    const [u, v, w] = data.velocity_linear || [0, 0, 0];
+    const speed = Math.sqrt(u*u + v*v + w*w);
+    const [qwv, qxv, qyv, qzv] = data.quaternion;
+    const q = new THREE.Quaternion(qxv, -qzv, qyv, qwv);
+    const velWorld = new THREE.Vector3(u, -w, v).applyQuaternion(q);
+    const dir = speed > 1e-4 ? velWorld.clone().normalize() : new THREE.Vector3(1, 0, 0);
+    velocityArrow.setDirection(dir);
+    velocityArrow.setLength(0.15 + Math.min(2.5, speed), 0.08, 0.04);
   }
 
   // sonar rays
@@ -1582,6 +1422,26 @@ function updateScene(data) {
     }
   }
 
+  // envelope de comparação entre múltiplos trials
+  if (envelopeMesh) {
+    const env = data.comparison_envelope;
+    if (env && env.min && env.max) {
+      const mn = env.min;
+      const mx = env.max;
+      const centerX = (mn[0] + mx[0]) * 0.5;
+      const centerY = ((-mx[2] + 10) + (-mn[2] + 10)) * 0.5;
+      const centerZ = (mn[1] + mx[1]) * 0.5;
+      const sizeX = Math.max(0.1, Math.abs(mx[0] - mn[0]));
+      const sizeY = Math.max(0.1, Math.abs(mx[2] - mn[2]));
+      const sizeZ = Math.max(0.1, Math.abs(mx[1] - mn[1]));
+      envelopeMesh.visible = true;
+      envelopeMesh.position.set(centerX, centerY, centerZ);
+      envelopeMesh.scale.set(sizeX, sizeY, sizeZ);
+    } else {
+      envelopeMesh.visible = false;
+    }
+  }
+
   // profundidade gauge
   const depthPct = Math.min(100, (z / 10) * 100);
   document.getElementById('gauge-fill').style.height = depthPct + '%';
@@ -1602,7 +1462,8 @@ function updateHUD(data) {
   document.getElementById('t-phi').textContent   = (phi*rad2deg).toFixed(1) + '°';
   document.getElementById('t-tht').textContent   = (tht*rad2deg).toFixed(1) + '°';
   document.getElementById('t-time').textContent  = data.time.toFixed(1) + ' s';
-  document.getElementById('t-ctrl').textContent  = data.controller.toUpperCase();
+  const ekfErr = Number(data?.errors?.ekf_position_error_m || 0);
+  document.getElementById('t-ctrl').textContent  = `${data.controller.toUpperCase()} | EKF ${ekfErr.toFixed(2)}m`;
 
   const rho = data.ballast.density_avg || 1000;
   document.getElementById('t-rho').textContent = rho.toFixed(0) + ' kg/m³';
@@ -1766,7 +1627,6 @@ function addObstacleMode() {
 
 function clearWaypoints() {
   clearWaypointMarkers();
-  SIM_waypoints = [];
   socket.emit('set_waypoint', { position: [5, 0, 5] });
 }
 
@@ -1870,25 +1730,14 @@ console.log('USV Digital Twin — Frontend initialized');
 # ─────────────────────────────────────────────
 
 if __name__ == '__main__':
-    init_simulation()
+    _initial_load_latest()
+    player_loop = PlayerLoop(player, _emit_replay_state, hz=60.0)
+    player_loop.start()
 
-    # inicia loop de simulação em thread separada
-    sim_thread = threading.Thread(target=simulation_loop, daemon=True)
-    sim_thread.start()
-
-    print("\n" + "="*50)
-    print("  USV Digital Twin — Visualization Server")
+    print("\n" + "=" * 58)
+    print("  USV Digital Twin — Replay Visualization Server")
+    print("  Replay dir:", VIEW['replay_dir'])
     print("  Abra: http://localhost:5000")
-    print("="*50 + "\n")
+    print("=" * 58 + "\n")
 
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
-
-  # Sistema anterior: as falhas para atingir o objetivo vinham de um problema
-  # físico anterior aos algoritmos. O centro de thrust estava deslocado para a
-  # traseira, gerando torque de pitch que inclinava o veículo para baixo e fazia
-  # o controle compensar com mais thrust, agravando a situação.
-  #
-  # Solução atual: o centro de thrust foi alinhado ao centro de massa, ficando
-  # posicionado nas laterais do veículo, na altura do centro de massa. Isso
-  # remove o torque indesejado e permite que o controle atue corretamente para
-  # atingir os waypoints.

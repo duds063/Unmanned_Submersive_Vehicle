@@ -164,10 +164,17 @@ class GeometryEngine:
         mesh   = engine.mesh_params
     """
 
-    def __init__(self, L: float, D: float, rho: float = RHO_FRESHWATER):
+    def __init__(
+        self,
+        L: float,
+        D: float,
+        rho: float = RHO_FRESHWATER,
+        roll_damping_factor: float = 5.0,
+    ):
         self.rho  = rho
         self.hull = HullGeometry(L=L, D=D)
         self.hull.validate()
+        self.roll_damping_factor = max(1.0, float(roll_damping_factor))
 
         self._coefficients: HydrodynamicCoefficients = None
         self._mesh_params:  MeshParameters           = None
@@ -231,6 +238,9 @@ class GeometryEngine:
         K_pp = 0.5 * rho * 2.0 * h.A_lateral * h.R ** 2
         M_qq = 0.5 * rho * Cd_l * h.A_lateral * (h.L / 6) ** 2
         N_rr = M_qq  # simetria pitch/yaw
+
+        # Modelo simplificado de aletas estabilizadoras: aumenta damping em roll.
+        K_pp *= self.roll_damping_factor
 
         # ── Arrasto linear (skin friction) ────────────────────────────
         # Estimativa baseada em número de Reynolds típico Re~10^5

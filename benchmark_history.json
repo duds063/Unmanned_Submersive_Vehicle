@@ -11,9 +11,39 @@
       "waypoints": []
     },
     "ranking": [
-      {"controller": "mpc", "score": -135.9, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 5.47, "mean_final_error_m": 6.77, "mean_time_s": 8.7, "mean_energy_score": 14.02, "mean_compute_ms": 11.73},
-      {"controller": "lqr", "score": -155.9, "success_rate": 0.0, "collision_rate": 0.5, "mean_tracking_error_m": 9.47, "mean_final_error_m": 6.63, "mean_time_s": 24.7, "mean_energy_score": 52.04, "mean_compute_ms": 0.60},
-      {"controller": "rl", "score": -201.6, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 18.76, "mean_final_error_m": 9.56, "mean_time_s": 40.0, "mean_energy_score": 65.39, "mean_compute_ms": 1.31}
+      {
+        "controller": "mpc",
+        "score": -135.9,
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "mean_tracking_error_m": 5.47,
+        "mean_final_error_m": 6.77,
+        "mean_time_s": 8.7,
+        "mean_energy_score": 14.02,
+        "mean_compute_ms": 11.73
+      },
+      {
+        "controller": "lqr",
+        "score": -155.9,
+        "success_rate": 0.0,
+        "collision_rate": 0.5,
+        "mean_tracking_error_m": 9.47,
+        "mean_final_error_m": 6.63,
+        "mean_time_s": 24.7,
+        "mean_energy_score": 52.04,
+        "mean_compute_ms": 0.6
+      },
+      {
+        "controller": "rl",
+        "score": -201.6,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 18.76,
+        "mean_final_error_m": 9.56,
+        "mean_time_s": 40.0,
+        "mean_energy_score": 65.39,
+        "mean_compute_ms": 1.31
+      }
     ],
     "controllers": {}
   },
@@ -25,12 +55,48 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.472},
-      {"controller": "rl", "score": -139.255, "success_rate": 0.0, "collision_rate": 0.667, "mean_tracking_error_m": 10.501, "mean_final_error_m": 6.2, "mean_time_s": 19.993, "mean_energy_score": 15.269, "mean_compute_ms": 1.688},
-      {"controller": "lqr", "score": -142.307, "success_rate": 0.0, "collision_rate": 0.667, "mean_tracking_error_m": 11.473, "mean_final_error_m": 5.598, "mean_time_s": 20.133, "mean_energy_score": 17.582, "mean_compute_ms": 1.068}
+      {
+        "controller": "mpc",
+        "score": 45.444,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 6.608,
+        "mean_final_error_m": 2.578,
+        "mean_time_s": 11.25,
+        "mean_energy_score": 9.24,
+        "mean_compute_ms": 0.472
+      },
+      {
+        "controller": "rl",
+        "score": -139.255,
+        "success_rate": 0.0,
+        "collision_rate": 0.667,
+        "mean_tracking_error_m": 10.501,
+        "mean_final_error_m": 6.2,
+        "mean_time_s": 19.993,
+        "mean_energy_score": 15.269,
+        "mean_compute_ms": 1.688
+      },
+      {
+        "controller": "lqr",
+        "score": -142.307,
+        "success_rate": 0.0,
+        "collision_rate": 0.667,
+        "mean_tracking_error_m": 11.473,
+        "mean_final_error_m": 5.598,
+        "mean_time_s": 20.133,
+        "mean_energy_score": 17.582,
+        "mean_compute_ms": 1.068
+      }
     ],
     "controllers": {}
   },
@@ -42,12 +108,48 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.213},
-      {"controller": "lqr", "score": -121.02, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 16.268, "mean_final_error_m": 3.721, "mean_time_s": 25.0, "mean_energy_score": 23.672, "mean_compute_ms": 0.379},
-      {"controller": "rl", "score": -174.893, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 11.863, "mean_final_error_m": 7.387, "mean_time_s": 18.54, "mean_energy_score": 16.308, "mean_compute_ms": 0.809}
+      {
+        "controller": "mpc",
+        "score": 45.444,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 6.608,
+        "mean_final_error_m": 2.578,
+        "mean_time_s": 11.25,
+        "mean_energy_score": 9.24,
+        "mean_compute_ms": 0.213
+      },
+      {
+        "controller": "lqr",
+        "score": -121.02,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 16.268,
+        "mean_final_error_m": 3.721,
+        "mean_time_s": 25.0,
+        "mean_energy_score": 23.672,
+        "mean_compute_ms": 0.379
+      },
+      {
+        "controller": "rl",
+        "score": -174.893,
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "mean_tracking_error_m": 11.863,
+        "mean_final_error_m": 7.387,
+        "mean_time_s": 18.54,
+        "mean_energy_score": 16.308,
+        "mean_compute_ms": 0.809
+      }
     ],
     "controllers": {}
   },
@@ -59,12 +161,48 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.163},
-      {"controller": "lqr", "score": -71.666, "success_rate": 0.333, "collision_rate": 0.667, "mean_tracking_error_m": 6.511, "mean_final_error_m": 6.417, "mean_time_s": 14.5, "mean_energy_score": 14.95, "mean_compute_ms": 0.339},
-      {"controller": "rl", "score": -128.994, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 15.694, "mean_final_error_m": 5.604, "mean_time_s": 25.0, "mean_energy_score": 24.2, "mean_compute_ms": 0.727}
+      {
+        "controller": "mpc",
+        "score": 45.444,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 6.608,
+        "mean_final_error_m": 2.578,
+        "mean_time_s": 11.25,
+        "mean_energy_score": 9.24,
+        "mean_compute_ms": 0.163
+      },
+      {
+        "controller": "lqr",
+        "score": -71.666,
+        "success_rate": 0.333,
+        "collision_rate": 0.667,
+        "mean_tracking_error_m": 6.511,
+        "mean_final_error_m": 6.417,
+        "mean_time_s": 14.5,
+        "mean_energy_score": 14.95,
+        "mean_compute_ms": 0.339
+      },
+      {
+        "controller": "rl",
+        "score": -128.994,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 15.694,
+        "mean_final_error_m": 5.604,
+        "mean_time_s": 25.0,
+        "mean_energy_score": 24.2,
+        "mean_compute_ms": 0.727
+      }
     ],
     "controllers": {}
   },
@@ -76,11 +214,37 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "lqr", "score": -56.194, "success_rate": 0.333, "collision_rate": 0.333, "mean_tracking_error_m": 7.915, "mean_final_error_m": 5.345, "mean_time_s": 21.31, "mean_energy_score": 19.073, "mean_compute_ms": 0.294},
-      {"controller": "mpc", "score": -101.243, "success_rate": 0.0, "collision_rate": 0.0, "mean_tracking_error_m": 9.213, "mean_final_error_m": 6.804, "mean_time_s": 25.0, "mean_energy_score": 22.271, "mean_compute_ms": 0.157}
+      {
+        "controller": "lqr",
+        "score": -56.194,
+        "success_rate": 0.333,
+        "collision_rate": 0.333,
+        "mean_tracking_error_m": 7.915,
+        "mean_final_error_m": 5.345,
+        "mean_time_s": 21.31,
+        "mean_energy_score": 19.073,
+        "mean_compute_ms": 0.294
+      },
+      {
+        "controller": "mpc",
+        "score": -101.243,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 9.213,
+        "mean_final_error_m": 6.804,
+        "mean_time_s": 25.0,
+        "mean_energy_score": 22.271,
+        "mean_compute_ms": 0.157
+      }
     ],
     "controllers": {}
   },
@@ -92,11 +256,37 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": -21.255, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 8.099, "mean_final_error_m": 3.65, "mean_time_s": 18.877, "mean_energy_score": 15.48, "mean_compute_ms": 0.158},
-      {"controller": "lqr", "score": -34.166, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 11.847, "mean_final_error_m": 2.957, "mean_time_s": 18.343, "mean_energy_score": 14.745, "mean_compute_ms": 0.308}
+      {
+        "controller": "mpc",
+        "score": -21.255,
+        "success_rate": 0.333,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 8.099,
+        "mean_final_error_m": 3.65,
+        "mean_time_s": 18.877,
+        "mean_energy_score": 15.48,
+        "mean_compute_ms": 0.158
+      },
+      {
+        "controller": "lqr",
+        "score": -34.166,
+        "success_rate": 0.333,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 11.847,
+        "mean_final_error_m": 2.957,
+        "mean_time_s": 18.343,
+        "mean_energy_score": 14.745,
+        "mean_compute_ms": 0.308
+      }
     ],
     "controllers": {}
   },
@@ -108,11 +298,37 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": false,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 45.444, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 6.608, "mean_final_error_m": 2.578, "mean_time_s": 11.25, "mean_energy_score": 9.24, "mean_compute_ms": 0.205},
-      {"controller": "lqr", "score": -58.992, "success_rate": 0.333, "collision_rate": 0.0, "mean_tracking_error_m": 16.005, "mean_final_error_m": 3.025, "mean_time_s": 17.97, "mean_energy_score": 17.194, "mean_compute_ms": 0.319}
+      {
+        "controller": "mpc",
+        "score": 45.444,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 6.608,
+        "mean_final_error_m": 2.578,
+        "mean_time_s": 11.25,
+        "mean_energy_score": 9.24,
+        "mean_compute_ms": 0.205
+      },
+      {
+        "controller": "lqr",
+        "score": -58.992,
+        "success_rate": 0.333,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 16.005,
+        "mean_final_error_m": 3.025,
+        "mean_time_s": 17.97,
+        "mean_energy_score": 17.194,
+        "mean_compute_ms": 0.319
+      }
     ],
     "controllers": {}
   },
@@ -125,12 +341,48 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": true,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 37.877, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 8.008, "mean_final_error_m": 2.569, "mean_time_s": 11.497, "mean_energy_score": 9.317, "mean_compute_ms": 0.193},
-      {"controller": "rl", "score": -137.109, "success_rate": 0.0, "collision_rate": 0.333, "mean_tracking_error_m": 12.675, "mean_final_error_m": 7.012, "mean_time_s": 22.9, "mean_energy_score": 20.978, "mean_compute_ms": 0.722},
-      {"controller": "lqr", "score": -166.694, "success_rate": 0.0, "collision_rate": 1.0, "mean_tracking_error_m": 10.642, "mean_final_error_m": 6.319, "mean_time_s": 21.367, "mean_energy_score": 20.527, "mean_compute_ms": 0.332}
+      {
+        "controller": "mpc",
+        "score": 37.877,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 8.008,
+        "mean_final_error_m": 2.569,
+        "mean_time_s": 11.497,
+        "mean_energy_score": 9.317,
+        "mean_compute_ms": 0.193
+      },
+      {
+        "controller": "rl",
+        "score": -137.109,
+        "success_rate": 0.0,
+        "collision_rate": 0.333,
+        "mean_tracking_error_m": 12.675,
+        "mean_final_error_m": 7.012,
+        "mean_time_s": 22.9,
+        "mean_energy_score": 20.978,
+        "mean_compute_ms": 0.722
+      },
+      {
+        "controller": "lqr",
+        "score": -166.694,
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "mean_tracking_error_m": 10.642,
+        "mean_final_error_m": 6.319,
+        "mean_time_s": 21.367,
+        "mean_energy_score": 20.527,
+        "mean_compute_ms": 0.332
+      }
     ],
     "controllers": {}
   },
@@ -143,12 +395,700 @@
       "dt": 0.01,
       "noise_scale": 0.5,
       "rayleigh_enabled": true,
-      "waypoints": [[5.0, 0.0, 5.0]]
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
     },
     "ranking": [
-      {"controller": "mpc", "score": 37.877, "success_rate": 0.667, "collision_rate": 0.0, "mean_tracking_error_m": 8.008, "mean_final_error_m": 2.569, "mean_time_s": 11.497, "mean_energy_score": 9.317, "mean_compute_ms": 0.235},
-      {"controller": "lqr", "score": -106.964, "success_rate": 0.0, "collision_rate": 0.333, "mean_tracking_error_m": 9.615, "mean_final_error_m": 4.843, "mean_time_s": 22.233, "mean_energy_score": 16.26, "mean_compute_ms": 0.346}
+      {
+        "controller": "mpc",
+        "score": 37.877,
+        "success_rate": 0.667,
+        "collision_rate": 0.0,
+        "mean_tracking_error_m": 8.008,
+        "mean_final_error_m": 2.569,
+        "mean_time_s": 11.497,
+        "mean_energy_score": 9.317,
+        "mean_compute_ms": 0.235
+      },
+      {
+        "controller": "lqr",
+        "score": -106.964,
+        "success_rate": 0.0,
+        "collision_rate": 0.333,
+        "mean_tracking_error_m": 9.615,
+        "mean_final_error_m": 4.843,
+        "mean_time_s": 22.233,
+        "mean_energy_score": 16.26,
+        "mean_compute_ms": 0.346
+      }
     ],
     "controllers": {}
+  },
+  {
+    "saved_at_epoch_s": 1777221896.6056755,
+    "scenario": {
+      "trials": 3,
+      "max_steps": 2000,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ],
+        [
+          11.343576569011642,
+          4.21378576804608,
+          5.0
+        ]
+      ]
+    },
+    "ranking": [
+      {
+        "controller": "mpc",
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 15.36887162036824,
+        "rms_tracking_error_m": 18.377594446982215,
+        "mean_final_error_m": 4.619528479343149,
+        "mean_clearance_m": 2.153503525371808,
+        "mean_path_length_m": 23.973414360848835,
+        "mean_speed_mps": 1.1989522643980612,
+        "mean_compute_ms": 0.34991430000377477,
+        "mean_energy_score": 19.175703303795693,
+        "score": -115.86110425628071
+      },
+      {
+        "controller": "rl",
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 13.267919818612151,
+        "rms_tracking_error_m": 15.328554243039244,
+        "mean_final_error_m": 7.450811330945768,
+        "mean_clearance_m": 1.9180103555500254,
+        "mean_path_length_m": 23.888945058908803,
+        "mean_speed_mps": 1.1946980772007356,
+        "mean_compute_ms": 1.2558711166668672,
+        "mean_energy_score": 17.686409626244195,
+        "score": -119.9321919477269
+      },
+      {
+        "controller": "lqr",
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 15.456666666666665,
+        "std_time_s": 2.576617075848788,
+        "mean_tracking_error_m": 7.355646320836752,
+        "rms_tracking_error_m": 8.01113670077026,
+        "mean_final_error_m": 12.249709380707424,
+        "mean_clearance_m": 0.22614161384254947,
+        "mean_path_length_m": 18.70276604456071,
+        "mean_speed_mps": 1.2072301378999284,
+        "mean_compute_ms": 0.5648426291970803,
+        "mean_energy_score": 13.780399413036823,
+        "score": -178.88562261775505
+      }
+    ],
+    "controllers": {
+      "lqr": {
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 15.456666666666665,
+        "std_time_s": 2.576617075848788,
+        "mean_tracking_error_m": 7.355646320836752,
+        "rms_tracking_error_m": 8.01113670077026,
+        "mean_final_error_m": 12.249709380707424,
+        "mean_clearance_m": 0.22614161384254947,
+        "mean_path_length_m": 18.70276604456071,
+        "mean_speed_mps": 1.2072301378999284,
+        "mean_compute_ms": 0.5648426291970803,
+        "mean_energy_score": 13.780399413036823,
+        "score": -178.88562261775505
+      },
+      "mpc": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 15.36887162036824,
+        "rms_tracking_error_m": 18.377594446982215,
+        "mean_final_error_m": 4.619528479343149,
+        "mean_clearance_m": 2.153503525371808,
+        "mean_path_length_m": 23.973414360848835,
+        "mean_speed_mps": 1.1989522643980612,
+        "mean_compute_ms": 0.34991430000377477,
+        "mean_energy_score": 19.175703303795693,
+        "score": -115.86110425628071
+      },
+      "rl": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 13.267919818612151,
+        "rms_tracking_error_m": 15.328554243039244,
+        "mean_final_error_m": 7.450811330945768,
+        "mean_clearance_m": 1.9180103555500254,
+        "mean_path_length_m": 23.888945058908803,
+        "mean_speed_mps": 1.1946980772007356,
+        "mean_compute_ms": 1.2558711166668672,
+        "mean_energy_score": 17.686409626244195,
+        "score": -119.9321919477269
+      }
+    }
+  },
+  {
+    "saved_at_epoch_s": 1777222282.42313,
+    "scenario": {
+      "trials": 1,
+      "max_steps": 2000,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "rayleigh_sigma": 0.03,
+      "env_disturbance_scale": 0.0,
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ],
+        [
+          14.366656475962383,
+          -2.4585757020202577,
+          5.0
+        ]
+      ]
+    },
+    "ranking": [
+      {
+        "controller": "rl",
+        "score": -114.71153139945454,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 8.070839191409794,
+        "rms_tracking_error_m": 8.652901959904053,
+        "mean_final_error_m": 12.129696724057608,
+        "mean_clearance_m": 4.0396513823279765,
+        "mean_path_length_m": 21.472431396462508,
+        "mean_speed_mps": 1.0737983091119876,
+        "mean_compute_ms": 1.3134818000019095,
+        "mean_energy_score": 14.75130747518581
+      },
+      {
+        "controller": "mpc",
+        "score": -142.07598429835153,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 11.402076140288258,
+        "rms_tracking_error_m": 14.149624856391878,
+        "mean_final_error_m": 12.136632043893556,
+        "mean_clearance_m": 2.574329400841808,
+        "mean_path_length_m": 22.5868470118943,
+        "mean_speed_mps": 1.1297427187175995,
+        "mean_compute_ms": 0.3038805000026059,
+        "mean_energy_score": 17.757939263882907
+      },
+      {
+        "controller": "lqr",
+        "score": -172.65500616944405,
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 19.1,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 7.850539760558298,
+        "rms_tracking_error_m": 8.678892488314732,
+        "mean_final_error_m": 10.196272325817628,
+        "mean_clearance_m": 0.21017131701560593,
+        "mean_path_length_m": 23.587641958203697,
+        "mean_speed_mps": 1.235303851960333,
+        "mean_compute_ms": 0.7177961256594049,
+        "mean_energy_score": 17.3710028265992
+      }
+    ],
+    "controllers": {
+      "lqr": {
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 19.1,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 7.850539760558298,
+        "rms_tracking_error_m": 8.678892488314732,
+        "mean_final_error_m": 10.196272325817628,
+        "mean_clearance_m": 0.21017131701560593,
+        "mean_path_length_m": 23.587641958203697,
+        "mean_speed_mps": 1.235303851960333,
+        "mean_compute_ms": 0.7177961256594049,
+        "mean_energy_score": 17.3710028265992,
+        "score": -172.65500616944405
+      },
+      "mpc": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 11.402076140288258,
+        "rms_tracking_error_m": 14.149624856391878,
+        "mean_final_error_m": 12.136632043893556,
+        "mean_clearance_m": 2.574329400841808,
+        "mean_path_length_m": 22.5868470118943,
+        "mean_speed_mps": 1.1297427187175995,
+        "mean_compute_ms": 0.3038805000026059,
+        "mean_energy_score": 17.757939263882907,
+        "score": -142.07598429835153
+      },
+      "rl": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 8.070839191409794,
+        "rms_tracking_error_m": 8.652901959904053,
+        "mean_final_error_m": 12.129696724057608,
+        "mean_clearance_m": 4.0396513823279765,
+        "mean_path_length_m": 21.472431396462508,
+        "mean_speed_mps": 1.0737983091119876,
+        "mean_compute_ms": 1.3134818000019095,
+        "mean_energy_score": 14.75130747518581,
+        "score": -114.71153139945454
+      }
+    }
+  },
+  {
+    "saved_at_epoch_s": 1777222791.0186403,
+    "scenario": {
+      "trials": 1,
+      "max_steps": 2000,
+      "dt": 0.01,
+      "noise_scale": 0.5,
+      "rayleigh_enabled": false,
+      "rayleigh_sigma": 0.03,
+      "env_disturbance_scale": 0.0,
+      "waypoints": [
+        [
+          5.0,
+          0.0,
+          5.0
+        ]
+      ]
+    },
+    "ranking": [
+      {
+        "controller": "rl",
+        "score": -62.14132060911402,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 8.070839191409794,
+        "rms_tracking_error_m": 8.652901959904053,
+        "mean_final_error_m": 3.3679949256675195,
+        "mean_clearance_m": 4.0396513823279765,
+        "mean_path_length_m": 21.472431396462508,
+        "mean_speed_mps": 1.0737983091119876,
+        "mean_compute_ms": 1.300455700006296,
+        "mean_energy_score": 14.75130747518581
+      },
+      {
+        "controller": "mpc",
+        "score": -99.43538367182835,
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 11.402076140288258,
+        "rms_tracking_error_m": 14.149624856391878,
+        "mean_final_error_m": 5.029865272806354,
+        "mean_clearance_m": 2.574329400841808,
+        "mean_path_length_m": 22.5868470118943,
+        "mean_speed_mps": 1.1297427187175995,
+        "mean_compute_ms": 0.33381485001291367,
+        "mean_energy_score": 17.757939263882907
+      },
+      {
+        "controller": "lqr",
+        "score": -151.92249344912148,
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 19.1,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 7.850539760558298,
+        "rms_tracking_error_m": 8.678892488314732,
+        "mean_final_error_m": 6.7408535390971975,
+        "mean_clearance_m": 0.21017131701560593,
+        "mean_path_length_m": 23.587641958203697,
+        "mean_speed_mps": 1.235303851960333,
+        "mean_compute_ms": 1.1507747644084927,
+        "mean_energy_score": 17.3710028265992
+      }
+    ],
+    "controllers": {
+      "lqr": {
+        "success_rate": 0.0,
+        "collision_rate": 1.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 19.1,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 7.850539760558298,
+        "rms_tracking_error_m": 8.678892488314732,
+        "mean_final_error_m": 6.7408535390971975,
+        "mean_clearance_m": 0.21017131701560593,
+        "mean_path_length_m": 23.587641958203697,
+        "mean_speed_mps": 1.235303851960333,
+        "mean_compute_ms": 1.1507747644084927,
+        "mean_energy_score": 17.3710028265992,
+        "score": -151.92249344912148
+      },
+      "mpc": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 11.402076140288258,
+        "rms_tracking_error_m": 14.149624856391878,
+        "mean_final_error_m": 5.029865272806354,
+        "mean_clearance_m": 2.574329400841808,
+        "mean_path_length_m": 22.5868470118943,
+        "mean_speed_mps": 1.1297427187175995,
+        "mean_compute_ms": 0.33381485001291367,
+        "mean_energy_score": 17.757939263882907,
+        "score": -99.43538367182835
+      },
+      "rl": {
+        "success_rate": 0.0,
+        "collision_rate": 0.0,
+        "out_of_bounds_rate": 0.0,
+        "mean_completion_rate": 0.0,
+        "mean_time_s": 20.0,
+        "std_time_s": 0.0,
+        "mean_tracking_error_m": 8.070839191409794,
+        "rms_tracking_error_m": 8.652901959904053,
+        "mean_final_error_m": 3.3679949256675195,
+        "mean_clearance_m": 4.0396513823279765,
+        "mean_path_length_m": 21.472431396462508,
+        "mean_speed_mps": 1.0737983091119876,
+        "mean_compute_ms": 1.300455700006296,
+        "mean_energy_score": 14.75130747518581,
+        "score": -62.14132060911402
+      }
+    }
+  },
+  {
+    "saved_at_epoch_s": 1777224923.936329,
+    "benchmark_mode": "split",
+    "categories": {
+      "stability": {
+        "benchmark_mode": "stability",
+        "scenario": {
+          "trials": 1,
+          "max_steps": 2000,
+          "dt": 0.01,
+          "noise_scale": 0.5,
+          "rayleigh_enabled": false,
+          "rayleigh_sigma": 0.03,
+          "env_disturbance_scale": 0.0,
+          "waypoints": [],
+          "hold_position": [
+            0.0,
+            0.0,
+            5.0
+          ],
+          "benchmark_mode": "stability"
+        },
+        "generated_at_epoch_s": 1777224901.1950662,
+        "runs": [
+          {
+            "benchmark_mode": "stability",
+            "controller": "lqr",
+            "trial": 1,
+            "termination": "timeout",
+            "success": false,
+            "collision": false,
+            "out_of_bounds": false,
+            "completion_rate": 1.0,
+            "waypoints_reached": 0,
+            "total_waypoints": 0,
+            "steps": 2000,
+            "sim_time_s": 20.0,
+            "mean_tracking_error_m": 15.403280819031654,
+            "rms_tracking_error_m": 20.46540471972901,
+            "final_position_error_m": 3.082394848355306,
+            "mean_attitude_error_deg": 104.99571557874049,
+            "rms_attitude_error_deg": 125.27519585370999,
+            "final_attitude_error_deg": 175.3156337544315,
+            "min_clearance_m": 3.473658481684039,
+            "path_length_m": 15.848484066546808,
+            "mean_speed_mps": 0.7926681700162943,
+            "mean_compute_ms": 0.9552243500029363,
+            "energy_score": 10.77140754973945,
+            "score": -221.38832062405277
+          }
+        ],
+        "ranking": [
+          {
+            "controller": "lqr",
+            "score": -221.38832062405277,
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 1.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 15.403280819031654,
+            "rms_tracking_error_m": 20.46540471972901,
+            "mean_final_error_m": 3.082394848355306,
+            "mean_attitude_error_deg": 104.99571557874049,
+            "rms_attitude_error_deg": 125.27519585370999,
+            "mean_final_attitude_error_deg": 175.3156337544315,
+            "mean_clearance_m": 3.473658481684039,
+            "mean_path_length_m": 15.848484066546808,
+            "mean_speed_mps": 0.7926681700162943,
+            "mean_compute_ms": 0.9552243500029363,
+            "mean_energy_score": 10.77140754973945
+          }
+        ],
+        "controllers": {
+          "lqr": {
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 1.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 15.403280819031654,
+            "rms_tracking_error_m": 20.46540471972901,
+            "mean_final_error_m": 3.082394848355306,
+            "mean_attitude_error_deg": 104.99571557874049,
+            "rms_attitude_error_deg": 125.27519585370999,
+            "mean_final_attitude_error_deg": 175.3156337544315,
+            "mean_clearance_m": 3.473658481684039,
+            "mean_path_length_m": 15.848484066546808,
+            "mean_speed_mps": 0.7926681700162943,
+            "mean_compute_ms": 0.9552243500029363,
+            "mean_energy_score": 10.77140754973945,
+            "score": -221.38832062405277
+          }
+        }
+      },
+      "mission": {
+        "benchmark_mode": "mission",
+        "scenario": {
+          "trials": 1,
+          "max_steps": 2000,
+          "dt": 0.01,
+          "noise_scale": 0.5,
+          "rayleigh_enabled": false,
+          "rayleigh_sigma": 0.03,
+          "env_disturbance_scale": 0.0,
+          "waypoints": [
+            [
+              5.0,
+              0.0,
+              5.0
+            ],
+            [
+              12.9936171140375,
+              -1.649859057927201,
+              5.0
+            ]
+          ],
+          "hold_position": [
+            0.0,
+            0.0,
+            5.0
+          ],
+          "benchmark_mode": "mission"
+        },
+        "generated_at_epoch_s": 1777224923.9349859,
+        "runs": [
+          {
+            "benchmark_mode": "mission",
+            "controller": "mpc",
+            "trial": 1,
+            "termination": "timeout",
+            "success": false,
+            "collision": false,
+            "out_of_bounds": false,
+            "completion_rate": 0.0,
+            "waypoints_reached": 0,
+            "total_waypoints": 2,
+            "steps": 2000,
+            "sim_time_s": 20.0,
+            "mean_tracking_error_m": 12.708280941657693,
+            "rms_tracking_error_m": 14.147495105566586,
+            "final_position_error_m": 9.595224754228804,
+            "mean_attitude_error_deg": 135.9524012969288,
+            "rms_attitude_error_deg": 146.11006983984186,
+            "final_attitude_error_deg": 170.53592902528052,
+            "min_clearance_m": 1.42593465785731,
+            "path_length_m": 24.88750057459878,
+            "mean_speed_mps": 1.2448587796683266,
+            "mean_compute_ms": 0.5568116500089673,
+            "energy_score": 18.27194225629198,
+            "score": -129.52701343695813
+          },
+          {
+            "benchmark_mode": "mission",
+            "controller": "rl",
+            "trial": 1,
+            "termination": "timeout",
+            "success": false,
+            "collision": false,
+            "out_of_bounds": false,
+            "completion_rate": 0.0,
+            "waypoints_reached": 0,
+            "total_waypoints": 2,
+            "steps": 2000,
+            "sim_time_s": 20.0,
+            "mean_tracking_error_m": 8.070839191409794,
+            "rms_tracking_error_m": 8.652901959904053,
+            "final_position_error_m": 10.539876677071542,
+            "mean_attitude_error_deg": 155.96810850674106,
+            "rms_attitude_error_deg": 163.78822886305466,
+            "final_attitude_error_deg": 145.58288749224025,
+            "min_clearance_m": 4.0396513823279765,
+            "path_length_m": 21.472431396462508,
+            "mean_speed_mps": 1.0737983091119876,
+            "mean_compute_ms": 2.3503506499928335,
+            "energy_score": 14.75130747518581,
+            "score": -105.17261111753815
+          }
+        ],
+        "ranking": [
+          {
+            "controller": "rl",
+            "score": -105.17261111753815,
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 0.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 8.070839191409794,
+            "rms_tracking_error_m": 8.652901959904053,
+            "mean_final_error_m": 10.539876677071542,
+            "mean_attitude_error_deg": 155.96810850674106,
+            "rms_attitude_error_deg": 163.78822886305466,
+            "mean_final_attitude_error_deg": 145.58288749224025,
+            "mean_clearance_m": 4.0396513823279765,
+            "mean_path_length_m": 21.472431396462508,
+            "mean_speed_mps": 1.0737983091119876,
+            "mean_compute_ms": 2.3503506499928335,
+            "mean_energy_score": 14.75130747518581
+          },
+          {
+            "controller": "mpc",
+            "score": -129.52701343695813,
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 0.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 12.708280941657693,
+            "rms_tracking_error_m": 14.147495105566586,
+            "mean_final_error_m": 9.595224754228804,
+            "mean_attitude_error_deg": 135.9524012969288,
+            "rms_attitude_error_deg": 146.11006983984186,
+            "mean_final_attitude_error_deg": 170.53592902528052,
+            "mean_clearance_m": 1.42593465785731,
+            "mean_path_length_m": 24.88750057459878,
+            "mean_speed_mps": 1.2448587796683266,
+            "mean_compute_ms": 0.5568116500089673,
+            "mean_energy_score": 18.27194225629198
+          }
+        ],
+        "controllers": {
+          "mpc": {
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 0.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 12.708280941657693,
+            "rms_tracking_error_m": 14.147495105566586,
+            "mean_final_error_m": 9.595224754228804,
+            "mean_attitude_error_deg": 135.9524012969288,
+            "rms_attitude_error_deg": 146.11006983984186,
+            "mean_final_attitude_error_deg": 170.53592902528052,
+            "mean_clearance_m": 1.42593465785731,
+            "mean_path_length_m": 24.88750057459878,
+            "mean_speed_mps": 1.2448587796683266,
+            "mean_compute_ms": 0.5568116500089673,
+            "mean_energy_score": 18.27194225629198,
+            "score": -129.52701343695813
+          },
+          "rl": {
+            "success_rate": 0.0,
+            "collision_rate": 0.0,
+            "out_of_bounds_rate": 0.0,
+            "mean_completion_rate": 0.0,
+            "mean_time_s": 20.0,
+            "std_time_s": 0.0,
+            "mean_tracking_error_m": 8.070839191409794,
+            "rms_tracking_error_m": 8.652901959904053,
+            "mean_final_error_m": 10.539876677071542,
+            "mean_attitude_error_deg": 155.96810850674106,
+            "rms_attitude_error_deg": 163.78822886305466,
+            "mean_final_attitude_error_deg": 145.58288749224025,
+            "mean_clearance_m": 4.0396513823279765,
+            "mean_path_length_m": 21.472431396462508,
+            "mean_speed_mps": 1.0737983091119876,
+            "mean_compute_ms": 2.3503506499928335,
+            "mean_energy_score": 14.75130747518581,
+            "score": -105.17261111753815
+          }
+        }
+      }
+    }
   }
 ]
