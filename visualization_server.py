@@ -18,7 +18,7 @@ import os
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
-from benchmark_engine import BenchmarkScenario, ControllerBenchmark
+from benchmark_engine import BenchmarkScenario, ControllerBenchmark, DEFAULT_MAX_STEPS
 from geometry_engine import GeometryEngine
 from physics_engine  import PhysicsEngine, VehicleState
 from sensor_engine   import SensorEngine, ExtendedKalmanFilter, Environment
@@ -139,7 +139,9 @@ def init_simulation():
 
     # waypoint inicial
     SIM['waypoints'] = [[5.0, 0.0, 5.0]]
-    control.set_waypoints([np.array([5.0, 0.0, 5.0], dtype=float)])
+    default_waypoint = np.array([5.0, 0.0, 5.0], dtype=float)
+    control.set_waypoints([default_waypoint])
+    hrl.set_waypoints([default_waypoint])
 
     print("✓ Simulação inicializada")
 
@@ -153,6 +155,7 @@ def simulation_loop():
 
     last_emit = time.time()
     emit_interval = 1.0 / 60.0   # 60Hz
+    rng = np.random.default_rng(42)
 
     while True:
         if not SIM['running'] or SIM['paused']:
@@ -162,7 +165,6 @@ def simulation_loop():
         dt = SIM['dt']
 
         # atualiza obstáculos dinâmicos
-        rng = np.random.default_rng()
         for dyn in dynamic_obstacles:
             dyn.step(dt, rng)
             # atualiza posição no ambiente
@@ -182,10 +184,8 @@ def simulation_loop():
         with physics_lock:
             ctrl = SIM['controller']
             if ctrl == 'lqr':
-                control.set_controller('lqr')
                 cmd = control.compute(est, SIM['time'])
             elif ctrl == 'mpc':
-                control.set_controller('mpc')
                 cmd = control.compute(est, SIM['time'])
             elif ctrl == 'rl':
                 cmd = hrl.compute(
@@ -307,7 +307,7 @@ def _build_benchmark_scenario(config=None):
             static_obstacles=[],
             dynamic_obstacles=dyn_obs,
             dt=float(config.get('dt', SIM['dt'])),
-            max_steps=int(config.get('max_steps', 2500)),
+          max_steps=int(config.get('max_steps', DEFAULT_MAX_STEPS)),
             trials=int(config.get('trials', 3)),
             pool_depth=10.0,
             pool_radius=30.0,
@@ -375,18 +375,25 @@ def on_pause():
 
 @socketio.on('reset')
 def on_reset():
-    SIM['time'] = 0.0
-    physics.reset(VehicleState(z=5.0))
-    ekf.reset(np.zeros(12))
-    with traj_lock:
-        SIM['trajectory'].clear()
-    emit('status', {'reset': True})
+  SIM['time'] = 0.0
+  initial_state = VehicleState(z=5.0)
+  physics.reset(initial_state)
+  ekf.reset(np.concatenate([initial_state.eta, initial_state.nu]))
+  waypoints = [np.array(wp, dtype=float) for wp in SIM['waypoints']] or [np.array([5.0, 0.0, 5.0], dtype=float)]
+  control.set_waypoints([wp.copy() for wp in waypoints])
+  hrl.set_waypoints([wp.copy() for wp in waypoints])
+  with traj_lock:
+    SIM['trajectory'].clear()
+  emit('status', {'reset': True})
 
 
 @socketio.on('set_controller')
 def on_set_controller(data):
     ctrl = data.get('controller', 'lqr')
     if ctrl in ['lqr', 'mpc', 'rl']:
+        if ctrl in ['lqr', 'mpc']:
+            with physics_lock:
+                control.set_controller(ctrl)
         SIM['controller'] = ctrl
         emit('status', {'controller': ctrl})
 
@@ -1026,8 +1033,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
 
     <div class="slider-group">
-      <div class="slider-label"><span>Max Steps</span><span id="bench-steps-val">2500</span></div>
-      <input type="range" min="500" max="5000" step="250" value="2500" id="bench-steps"
+      <div class="slider-label"><span>Max Steps</span><span id="bench-steps-val">2000</span></div>
+      <input type="range" min="500" max="5000" step="250" value="2000" id="bench-steps"
              oninput="document.getElementById('bench-steps-val').textContent = this.value">
     </div>
 
@@ -1874,7 +1881,7 @@ if __name__ == '__main__':
     print("  Abra: http://localhost:5000")
     print("="*50 + "\n")
 
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
 
   # Sistema anterior: as falhas para atingir o objetivo vinham de um problema
   # físico anterior aos algoritmos. O centro de thrust estava deslocado para a

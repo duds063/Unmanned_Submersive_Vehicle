@@ -1,7 +1,11 @@
+import argparse
+import json
+import os
 import time
 import io
 import contextlib
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -15,13 +19,16 @@ from rl_controller import integrate_rl
 from mission_engine import COLLISION_THRESHOLD, DynamicObstacle, EpisodeTermination
 
 
+DEFAULT_MAX_STEPS = 2000
+
+
 @dataclass
 class BenchmarkScenario:
     waypoints: List[List[float]]
     static_obstacles: List[Dict]
     dynamic_obstacles: List[Dict]
     dt: float = 0.01
-    max_steps: int = 2500
+    max_steps: int = DEFAULT_MAX_STEPS
     trials: int = 3
     pool_depth: float = 10.0
     pool_radius: float = 30.0
@@ -372,3 +379,78 @@ class ControllerBenchmark:
     @staticmethod
     def _quiet_stdout():
         return contextlib.redirect_stdout(io.StringIO())
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Run USV controller benchmarks")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
+    parser.add_argument("--output-dir", type=str, default="./training_runs")
+    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument("--dt", type=float, default=0.01)
+    parser.add_argument("--pool-depth", type=float, default=10.0)
+    parser.add_argument("--pool-radius", type=float, default=30.0)
+    parser.add_argument("--noise-scale", type=float, default=0.5)
+    parser.add_argument("--enable-rayleigh", action="store_true")
+    parser.add_argument("--rayleigh-sigma", type=float, default=0.03)
+    parser.add_argument("--env-disturbance-scale", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--controllers", nargs="*", default=["lqr", "mpc", "rl"])
+    parser.add_argument(
+        "--waypoint",
+        action="append",
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        type=float,
+        help="Waypoint in NED coordinates. Can be provided multiple times.",
+    )
+    parser.add_argument("--waypoints-file", type=str, default=None)
+    parser.add_argument("--output-file", type=str, default="benchmark_report.json")
+    return parser.parse_args()
+
+
+def _load_waypoints(args) -> List[List[float]]:
+    if args.waypoints_file:
+        path = Path(args.waypoints_file)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("waypoints-file must contain a JSON list")
+        return [[float(coord) for coord in waypoint] for waypoint in data]
+    if args.waypoint:
+        return [[float(x), float(y), float(z)] for x, y, z in args.waypoint]
+    return [[5.0, 0.0, 5.0]]
+
+
+def main() -> int:
+    args = _parse_args()
+    scenario = BenchmarkScenario(
+        waypoints=_load_waypoints(args),
+        static_obstacles=[],
+        dynamic_obstacles=[],
+        dt=float(args.dt),
+        max_steps=int(args.max_steps),
+        trials=int(args.trials),
+        pool_depth=float(args.pool_depth),
+        pool_radius=float(args.pool_radius),
+        noise_scale=float(args.noise_scale),
+        rayleigh_enabled=bool(args.enable_rayleigh),
+        rayleigh_sigma=float(args.rayleigh_sigma),
+        env_disturbance_scale=float(args.env_disturbance_scale),
+        seed=int(args.seed),
+    )
+
+    benchmark = ControllerBenchmark(args.checkpoint_dir)
+    result = benchmark.run(scenario, controllers=list(args.controllers))
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / args.output_file
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    print(f"Benchmark saved to {output_path}")
+    print(json.dumps(result.get("ranking", []), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
