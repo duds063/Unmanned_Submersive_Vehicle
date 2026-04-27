@@ -37,7 +37,7 @@ geometry_engine.py: Hull geometry calculations (Von Kármán ogive) and coeffici
 
 visualization_server.py: Flask + SocketIO bridge for real-time Three.js rendering.
 
-🛠️ Installation & Usage
+## Installation & Usage
 Clone the repository:
 
 Bash
@@ -55,7 +55,7 @@ Bash
 python physics_engine.py
 python control_engine.py
 ```
-🚀 Quick Start (Docker)
+## Quick Start (Docker)
 To ensure environment stability and prevent dependency conflicts, this testbed is fully containerized.
 
 Prerequisites
@@ -71,13 +71,13 @@ Bash
 # Build the image locally
 docker build -t usv-testbed .
 ```
-# Run the simulation
+Run the simulation
 ```
 docker run -p 5000:5000 duds063/usv-final:latest
 ```
 
 Note: The simulation is configured to run in headless mode. Once finished, the high-fidelity 6-DOF telemetry and performance plots (LQR/MPC convergence) will be exported to the /results folder.
-Scientific Methodology
+## Scientific Methodology
 Developed as an evolution of the Inertial Control Sandbox (ICS), this research focuses on the transition from simple inertial systems to complex maritime dynamics. By utilizing Domain Randomization during training, the AI controller becomes resilient to variations in water density and electromagnetic sensor noise.
 
 Developed by: Eduardo Souza Costa and Marcelo Henrique Valdiero.
