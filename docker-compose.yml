@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  # Servidor de visualização web
+  server:
+    build: .
+    container_name: usv-server
+    ports:
+      - "5000:5000"
+    environment:
+      - USV_MODE=server
+      - FLASK_ENV=production
+    volumes:
+      - ./training_runs:/app/training_runs
+      - ./checkpoints:/app/checkpoints
+    command: server
+    restart: unless-stopped
+
+  # Benchmark/simulações
+  benchmark:
+    build: .
+    container_name: usv-benchmark
+    environment:
+      - USV_MODE=benchmark
+    volumes:
+      - ./training_runs:/app/training_runs
+      - ./checkpoints:/app/checkpoints
+    command: benchmark
+    restart: "no"
+    depends_on:
+      - server
+
+  # Treinamento RL (opcional)
+  training:
+    build: .
+    container_name: usv-training
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./training_runs:/app/training_runs
+      - ./checkpoints:/app/checkpoints
+    command: python train_rl_pipeline.py
+    restart: "no"
