@@ -55,6 +55,28 @@ Bash
 python physics_engine.py
 python control_engine.py
 ```
+🚀 Quick Start (Docker)
+To ensure environment stability and prevent dependency conflicts, this testbed is fully containerized.
+
+Prerequisites
+Docker
+
+Docker Compose (optional, but recommended)
+
+Running the Simulation
+You can pull and run the latest stable environment with a single command:
+
+Bash
+```
+# Build the image locally
+docker build -t usv-testbed .
+```
+# Run the simulation
+```
+docker run -p 5000:5000 duds063/usv-final:latest
+```
+
+Note: The simulation is configured to run in headless mode. Once finished, the high-fidelity 6-DOF telemetry and performance plots (LQR/MPC convergence) will be exported to the /results folder.
 Scientific Methodology
 Developed as an evolution of the Inertial Control Sandbox (ICS), this research focuses on the transition from simple inertial systems to complex maritime dynamics. By utilizing Domain Randomization during training, the AI controller becomes resilient to variations in water density and electromagnetic sensor noise.
 
