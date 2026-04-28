@@ -304,6 +304,8 @@ class ControllerBenchmark:
                     cmd = control.compute(est, physics.time)
             compute_samples_ms.append((time.perf_counter() - t0) * 1000.0)
 
+            env_cur, env_turb = sensors.get_environmental_state()
+            env_harm = sensors.get_environmental_harmonics()
             physics.step(
                 thruster_power=cmd.thruster_power,
                 thruster_theta=cmd.thruster_theta,
@@ -313,6 +315,9 @@ class ControllerBenchmark:
                 thruster2_theta=cmd.thruster2_theta,
                 thruster2_phi=cmd.thruster2_phi,
                 dt=scenario.dt,
+                env_current_world=env_cur,
+                env_turbulence=env_turb,
+                env_harmonics=env_harm,
             )
             steps += 1
 

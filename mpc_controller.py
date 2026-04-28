@@ -442,6 +442,8 @@ if __name__ == "__main__":
             est      = ekf.state_estimate
             last_cmd = control.compute(est, physics.time)
 
+        env_cur, env_turb = sensors.get_environmental_state()
+        env_harm = sensors.get_environmental_harmonics()
         physics.step(
             thruster_power=last_cmd.thruster_power,
             thruster_theta=last_cmd.thruster_theta,
@@ -451,6 +453,9 @@ if __name__ == "__main__":
             thruster2_theta=last_cmd.thruster2_theta,
             thruster2_phi=last_cmd.thruster2_phi,
             dt=dt_physics,
+            env_current_world=env_cur,
+            env_turbulence=env_turb,
+            env_harmonics=env_harm,
         )
 
         errors_z.append(abs(physics.state.z - 2.0))
@@ -495,6 +500,8 @@ if __name__ == "__main__":
                 est      = ekf.state_estimate
                 last_cmd = control.compute(est, physics.time)
 
+            env_cur, env_turb = sensors.get_environmental_state()
+            env_harm = sensors.get_environmental_harmonics()
             physics.step(
                 thruster_power=last_cmd.thruster_power,
                 thruster_theta=last_cmd.thruster_theta,
@@ -504,6 +511,9 @@ if __name__ == "__main__":
                 thruster2_theta=last_cmd.thruster2_theta,
                 thruster2_phi=last_cmd.thruster2_phi,
                 dt=dt_physics,
+                env_current_world=env_cur,
+                env_turbulence=env_turb,
+                env_harmonics=env_harm,
             )
             errors.append(abs(physics.state.z - 2.0))
 

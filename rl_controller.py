@@ -1372,12 +1372,17 @@ if __name__ == "__main__":
         cmd = hrl.compute(est, bundle.imu, bundle.sonar,
                           dt, training=True)
 
+        env_cur, env_turb = sensors.get_environmental_state()
+        env_harm = sensors.get_environmental_harmonics()
         physics.step(
             thruster_power=cmd.thruster_power,
             thruster_theta=cmd.thruster_theta,
             thruster_phi=cmd.thruster_phi,
             ballast_cmd=cmd.ballast_cmd,
             dt=dt,
+            env_current_world=env_cur,
+            env_turbulence=env_turb,
+            env_harmonics=env_harm,
         )
 
     wall = _time.time() - t_start

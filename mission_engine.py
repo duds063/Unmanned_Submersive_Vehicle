@@ -561,6 +561,8 @@ class MissionEngine:
             )
 
             # física
+            env_cur, env_turb = self.sensors.get_environmental_state()
+            env_harm = self.sensors.get_environmental_harmonics()
             self.physics.step(
                 thruster_power=cmd.thruster_power,
                 thruster_theta=cmd.thruster_theta,
@@ -570,6 +572,9 @@ class MissionEngine:
                 thruster2_theta=cmd.thruster2_theta,
                 thruster2_phi=cmd.thruster2_phi,
                 dt=dt,
+                env_current_world=env_cur,
+                env_turbulence=env_turb,
+                env_harmonics=env_harm,
             )
 
             step += 1

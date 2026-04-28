@@ -1000,6 +1000,8 @@ if __name__ == "__main__":
         est = ekf.state_estimate
         cmd = control.compute(est, physics.time)
 
+        env_cur, env_turb = sensors.get_environmental_state()
+        env_harm = sensors.get_environmental_harmonics()
         physics.step(
             thruster_power=cmd.thruster_power,
             thruster_theta=cmd.thruster_theta,
@@ -1009,6 +1011,9 @@ if __name__ == "__main__":
             thruster2_theta=cmd.thruster2_theta,
             thruster2_phi=cmd.thruster2_phi,
             dt=dt,
+            env_current_world=env_cur,
+            env_turbulence=env_turb,
+            env_harmonics=env_harm,
         )
 
         errors_z.append(abs(physics.state.z - 2.0))

@@ -1019,7 +1019,9 @@ if __name__ == "__main__":
     dt = 0.01
 
     for i in range(300):
-        physics.step(0.3, 0.0, 0.0, 0.0, dt)
+        env_cur, env_turb = sensors.get_environmental_state()
+        env_harm = sensors.get_environmental_harmonics()
+        physics.step(0.3, 0.0, 0.0, 0.0, dt=dt, env_current_world=env_cur, env_turbulence=env_turb, env_harmonics=env_harm)
         bundle = sensors.read(physics.state, physics.time)
 
         ekf.predict(dt)
