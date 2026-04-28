@@ -57,6 +57,14 @@ class PipelineConfig:
     enable_rayleigh: bool = False
     rayleigh_sigma: float = 0.03
     env_disturbance_scale: float = 1.0
+    env_force_gain: float = 1.0
+    env_turbulence_gain: float = 1.0
+    env_wave_freq: float = 0.8
+    env_spectral_enabled: bool = False
+    wave_num_harmonics: int = 8
+    wave_peak_freq: float = 0.8
+    wave_amp_scale: float = 0.02
+    wave_hs: float = 0.2
     seed: int = 42
     fresh: bool = False
     checkpoint_dir: str = "./checkpoints"
@@ -96,11 +104,17 @@ def build_stack(config: PipelineConfig):
         rayleigh_sigma=config.rayleigh_sigma,
         enable_rayleigh=config.enable_rayleigh,
         seed=config.seed,
+        wave_hs=config.wave_hs,
     )
     sensors.set_environmental_disturbance(
         enabled=config.enable_rayleigh,
         scale=config.env_disturbance_scale,
         rayleigh_sigma=config.rayleigh_sigma,
+        spectral=config.env_spectral_enabled,
+        wave_num_harmonics=config.wave_num_harmonics,
+        wave_peak_freq=config.wave_peak_freq,
+        wave_amp_scale=config.wave_amp_scale,
+        wave_hs=config.wave_hs,
     )
     ekf = ExtendedKalmanFilter(physics)
 
@@ -112,6 +126,11 @@ def build_stack(config: PipelineConfig):
     if not waypoints:
         waypoints = _default_waypoints(config.waypoint_depth)
     hrl.set_waypoints(waypoints)
+
+    # configura parâmetros de acoplamento ambiental no physics (ganhos e frequências)
+    physics.env_force_gain = float(config.env_force_gain)
+    physics.env_turbulence_gain = float(config.env_turbulence_gain)
+    physics.env_wave_freq = float(config.env_wave_freq)
 
     return geometry, physics, sensors, ekf, control, hrl, waypoints
 
@@ -188,6 +207,7 @@ def step_hierarchy(
         return_info=True,
     )
 
+    env_harm = sensors.get_environmental_harmonics()
     physics.step(
         thruster_power=cmd.thruster_power,
         thruster_theta=cmd.thruster_theta,
@@ -197,6 +217,9 @@ def step_hierarchy(
         thruster2_theta=cmd.thruster2_theta,
         thruster2_phi=cmd.thruster2_phi,
         dt=dt,
+        env_current_world=sensors.get_environmental_state()[0],
+        env_turbulence=sensors.get_environmental_state()[1],
+        env_harmonics=env_harm,
     )
 
     return {
@@ -300,6 +323,7 @@ def evaluate(hrl: HRLController, physics: PhysicsEngine, sensors: SensorEngine, 
 
         prev_idx = hrl.n3.current_wp_idx
         cmd = hrl.compute(est, bundle.imu, bundle.sonar, config.dt, training=False)
+        env_harm = sensors.get_environmental_harmonics()
         physics.step(
             thruster_power=cmd.thruster_power,
             thruster_theta=cmd.thruster_theta,
@@ -309,6 +333,9 @@ def evaluate(hrl: HRLController, physics: PhysicsEngine, sensors: SensorEngine, 
             thruster2_theta=cmd.thruster2_theta,
             thruster2_phi=cmd.thruster2_phi,
             dt=config.dt,
+            env_current_world=sensors.get_environmental_state()[0],
+            env_turbulence=sensors.get_environmental_state()[1],
+            env_harmonics=env_harm,
         )
 
         total_steps += 1
@@ -347,6 +374,22 @@ def parse_args() -> PipelineConfig:
                         help="Escala da distribuição de Rayleigh para a maresia.")
     parser.add_argument("--env-disturbance-scale", type=float, default=1.0,
                         help="Intensidade global da perturbação ambiental Rayleigh.")
+    parser.add_argument("--env-force-gain", type=float, default=1.0,
+                        help="Ganho global aplicado às forças ambientais sobre o casco.")
+    parser.add_argument("--env-turbulence-gain", type=float, default=1.0,
+                        help="Ganho específico para componentes de turbulência/ondas.")
+    parser.add_argument("--env-wave-freq", type=float, default=0.8,
+                        help="Frequência dominante (Hz) usada no modelo simplificado de ondas.")
+    parser.add_argument("--env-spectral", action="store_true",
+                        help="Ativa modelo espectral de ondas (superposição harmônica).")
+    parser.add_argument("--wave-harmonics", type=int, default=8,
+                        help="Número de harmônicos no modelo espectral.")
+    parser.add_argument("--wave-peak-freq", type=float, default=0.8,
+                        help="Frequência de pico (Hz) do espectro de ondas.")
+    parser.add_argument("--wave-amp-scale", type=float, default=0.02,
+                        help="Escala de amplitude para os harmônicos (m/s).")
+    parser.add_argument("--wave-hs", type=float, default=0.2,
+                        help="Significant Wave Height (m) — calibra espectro JONSWAP.")
     parser.add_argument("--waypoint-threshold", type=float, default=0.5,
                         help="Raio (m) para considerar waypoint atingido.")
     parser.add_argument("--seed", type=int, default=42)
@@ -370,6 +413,14 @@ def parse_args() -> PipelineConfig:
         enable_rayleigh=args.enable_rayleigh,
         rayleigh_sigma=args.rayleigh_sigma,
         env_disturbance_scale=args.env_disturbance_scale,
+        env_force_gain=args.env_force_gain,
+        env_turbulence_gain=args.env_turbulence_gain,
+        env_wave_freq=args.env_wave_freq,
+        env_spectral_enabled=args.env_spectral,
+        wave_num_harmonics=args.wave_harmonics,
+        wave_peak_freq=args.wave_peak_freq,
+        wave_amp_scale=args.wave_amp_scale,
+        wave_hs=args.wave_hs,
         waypoint_threshold=args.waypoint_threshold,
         seed=args.seed,
         fresh=args.fresh,

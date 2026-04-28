@@ -298,6 +298,7 @@ class SensorEngine:
         rayleigh_sigma: float = RAYLEIGH_DEFAULT_SIGMA,
         enable_rayleigh: bool = False,
         seed:        int   = 42,
+        wave_hs: float = 0.2,
     ):
         self.env         = environment
         self.noise_scale = noise_scale
@@ -324,6 +325,19 @@ class SensorEngine:
         self._last_sonar_update = -1.0
         self._sonar_dt = 1.0 / SONAR_UPDATE_HZ
         self._last_sonar_readings: List[SonarReading] = []
+        # spectral wave model (superposição harmônica)
+        self.spectral_enabled = False
+        self.wave_num_harmonics = 8
+        self.wave_peak_freq = 0.8
+        self.wave_hs = max(0.01, float(wave_hs))  # Significant Wave Height (m)
+        self.wave_spectrum = 'jonswap'  # or 'pm' for Pierson-Moskowitz
+        self.wave_amp_scale = 0.02
+        self.wave_hs = 0.2
+        self.wave_spectrum = 'jonswap'
+        self._harmonic_freqs = None
+        self._harmonic_phases = None
+        self._harmonic_dirs = None
+        self._harmonic_amps = None
 
     # ─── Interface pública ───────────────────
 
@@ -351,6 +365,11 @@ class SensorEngine:
         enabled: bool,
         scale: float = 1.0,
         rayleigh_sigma: Optional[float] = None,
+        spectral: bool = False,
+        wave_num_harmonics: int = 8,
+        wave_peak_freq: float = 0.8,
+        wave_amp_scale: float = 0.02,
+        wave_hs: Optional[float] = None,
     ) -> None:
         """
         Configura perturbação ambiental não gaussiana (Rayleigh).
@@ -365,9 +384,64 @@ class SensorEngine:
         if rayleigh_sigma is not None:
             self.rayleigh_sigma = max(0.0, float(rayleigh_sigma))
 
+        # spectral options
+        self.spectral_enabled = bool(spectral)
+        self.wave_num_harmonics = int(max(1, wave_num_harmonics))
+        self.wave_peak_freq = float(wave_peak_freq)
+        self.wave_amp_scale = float(wave_amp_scale)
+        if wave_hs is not None:
+            self.wave_hs = max(0.01, float(wave_hs))
+
         if (not self.enable_rayleigh) or self.environment_scale == 0.0:
             self._env_current_world[:] = 0.0
             self._env_turbulence = 0.0
+            # clear spectral harmonics
+            self._harmonic_freqs = None
+            self._harmonic_phases = None
+            self._harmonic_dirs = None
+            self._harmonic_amps = None
+            return
+
+        # initialize spectral harmonics if requested
+        if self.spectral_enabled and self._harmonic_freqs is None:
+            n = self.wave_num_harmonics
+            # frequencies spaced around peak
+            freqs = np.linspace(self.wave_peak_freq * 0.5, self.wave_peak_freq * 1.5, n)
+            phases = self.rng.uniform(0.0, 2.0 * np.pi, size=n)
+            dirs = self.rng.normal(0.0, 1.0, size=(n, 3))
+            dirs /= (np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-9)
+            # amplitudes: use spectral model (JONSWAP/PM) to derive surface elevation S(f),
+            # then convert to orbital velocity amplitude A_v ~ 2π f * sqrt(2 S(f) df).
+            df = freqs[1] - freqs[0] if n > 1 else freqs[0]
+            # base spectrum (unnormalized)
+            def jonswap_spectrum(f, fp, gamma=3.3):
+                g = 9.81
+                sigma = np.where(f <= fp, 0.07, 0.09)
+                r = np.exp(- (f - fp)**2 / (2 * sigma**2 * fp**2))
+                S = (g**2) * (2*np.pi)**-4 * f**-5 * np.exp(-1.25 * (fp / f)**4) * (gamma ** r)
+                return S
+
+            if self.wave_spectrum == 'jonswap':
+                S0 = jonswap_spectrum(freqs, self.wave_peak_freq)
+            else:
+                S0 = jonswap_spectrum(freqs, self.wave_peak_freq)
+
+            # scale S0 so that variance matches Hs^2/16
+            desired_var = (self.wave_hs ** 2) / 16.0
+            var0 = float(np.sum(S0) * df)
+            scale = (desired_var / var0) if var0 > 0 else 0.0
+            S = S0 * scale
+
+            # surface elevation amplitude per harmonic (m)
+            eta_amp = np.sqrt(2.0 * S * df)
+            # approximate orbital velocity amplitude (m/s)
+            amps = (2.0 * np.pi * freqs) * eta_amp
+            # apply global scaling
+            amps = amps * self.wave_amp_scale * self.environment_scale
+            self._harmonic_freqs = freqs
+            self._harmonic_phases = phases
+            self._harmonic_dirs = dirs
+            self._harmonic_amps = amps
 
     def _signed_rayleigh_noise(self, size=None) -> np.ndarray:
         """Amostra ruído Rayleigh com sinal aleatório para perturbações bidirecionais."""
@@ -400,17 +474,57 @@ class SensorEngine:
         tau = 2.0
         alpha = 1.0 - np.exp(-dt_env / tau)
 
-        direction = self.rng.normal(0.0, 1.0, 3)
-        direction /= (np.linalg.norm(direction) + 1e-9)
-        amp = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
-        target_current = direction * amp * self.environment_scale
-        self._env_current_world = (
-            (1.0 - alpha) * self._env_current_world +
-            alpha * target_current
-        )
+        if self.spectral_enabled and self._harmonic_freqs is not None:
+            # build spectral current as sum of harmonics
+            vec = np.zeros(3)
+            turb_vals = []
+            for i, f in enumerate(self._harmonic_freqs):
+                phase = 2.0 * np.pi * f * time + float(self._harmonic_phases[i])
+                inst = float(self._harmonic_amps[i] * np.sin(phase))
+                vec += inst * self._harmonic_dirs[i]
+                turb_vals.append(abs(inst))
 
-        turb_target = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
-        self._env_turbulence = (1.0 - alpha) * self._env_turbulence + alpha * turb_target
+            target_current = vec
+            self._env_current_world = (1.0 - alpha) * self._env_current_world + alpha * target_current
+            turb_target = float(np.mean(turb_vals)) if turb_vals else 0.0
+            self._env_turbulence = (1.0 - alpha) * self._env_turbulence + alpha * turb_target
+        else:
+            direction = self.rng.normal(0.0, 1.0, 3)
+            direction /= (np.linalg.norm(direction) + 1e-9)
+            amp = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
+            target_current = direction * amp * self.environment_scale
+            self._env_current_world = (
+                (1.0 - alpha) * self._env_current_world +
+                alpha * target_current
+            )
+
+            turb_target = float(self.rng.rayleigh(max(self.rayleigh_sigma, 1e-9)))
+            self._env_turbulence = (1.0 - alpha) * self._env_turbulence + alpha * turb_target
+
+    def get_environmental_state(self) -> Tuple[np.ndarray, float]:
+        """
+        Retorna o estado ambiental atual que representa corrente (vetor no referencial
+        do mundo) e um escalar de turbulência.
+
+        Usado pelo `PhysicsEngine` para converter em forças hidrodinâmicas.
+        """
+        return self._env_current_world.copy(), float(self._env_turbulence)
+
+    def get_environmental_harmonics(self):
+        """
+        Retorna tupla (freqs, amps, phases, dirs) quando o modelo espectral está ativo.
+        Caso contrário retorna None.
+        - freqs: (n,) Hz
+        - amps:  (n,) velocidade amplitude (m/s)
+        - phases: (n,) rad
+        - dirs:  (n,3) direção unitária no referencial mundo
+        """
+        if not self.spectral_enabled or self._harmonic_freqs is None:
+            return None
+        return (self._harmonic_freqs.copy(),
+                self._harmonic_amps.copy(),
+                self._harmonic_phases.copy(),
+                self._harmonic_dirs.copy())
 
     # ─── IMU ─────────────────────────────────
 

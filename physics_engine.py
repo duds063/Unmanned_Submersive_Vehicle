@@ -315,6 +315,19 @@ class PhysicsEngine:
         # monta matrizes de inércia uma vez
         self._M     = self._build_mass_matrix()
         self._M_inv = np.linalg.inv(self._M)
+        # ambiente externo (corrente/turbulência) no referencial do corpo
+        self._env_current_body = np.zeros(3, dtype=float)
+        self._env_turbulence = 0.0
+        # parâmetros para modelagem de forças ambientais (ajustáveis)
+        self.env_force_gain = 1.0
+        self.env_turbulence_gain = 1.0
+        self.env_wave_freq = 0.8
+        # fase aleatória para o componente oscilatório de onda
+        self._rng = np.random.default_rng(0)
+        self._env_wave_phase = float(self._rng.uniform(0.0, 2.0 * np.pi))
+        # previous environmental current (para derivada temporal)
+        self._prev_env_current_body = self._env_current_body.copy()
+        self._env_dt = 0.0
 
     # ─── Interface pública ───────────────────
 
@@ -342,6 +355,9 @@ class PhysicsEngine:
         thruster2_theta: Optional[float] = None,
         thruster2_phi:   Optional[float] = None,
         dt:             float = 0.01,
+        env_current_world: Optional[np.ndarray] = None,
+        env_turbulence: float = 0.0,
+        env_harmonics: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> VehicleState:
         """
         Avança a simulação por um timestep dt.
@@ -383,6 +399,29 @@ class PhysicsEngine:
         self._M     = self._build_mass_matrix()
         self._M_inv = np.linalg.inv(self._M)
 
+        # atualiza estado ambiental para uso nas equações (converte pra body)
+        # guarda anterior para derivada temporal
+        self._prev_env_current_body = self._env_current_body.copy()
+        self._env_dt = float(dt)
+        if env_current_world is not None:
+            # usa orientação atual para converter corrente (world -> body)
+            phi, tht, psi = self._state.phi, self._state.tht, self._state.psi
+            R = self._rotation_matrix(phi, tht, psi)
+            # R transforma body->world, então R.T transforma world->body
+            self._env_current_body = R.T @ np.asarray(env_current_world, dtype=float)
+        else:
+            self._env_current_body = np.zeros(3, dtype=float)
+        self._env_turbulence = float(env_turbulence)
+        # if harmonics provided, convert them to body frame once (freqs, amps, phases, dirs)
+        self._env_harmonics_body = None
+        if env_harmonics is not None:
+            freqs, amps, phases, dirs = env_harmonics
+            # convert dirs (world->body)
+            phi, tht, psi = self._state.phi, self._state.tht, self._state.psi
+            R = self._rotation_matrix(phi, tht, psi)
+            dirs_body = (R.T @ dirs.T).T
+            self._env_harmonics_body = (np.asarray(freqs), np.asarray(amps), np.asarray(phases), np.asarray(dirs_body))
+
         # integração RK4
         self._state = self._rk4(self._state, dt)
         self._time += dt
@@ -419,6 +458,36 @@ class PhysicsEngine:
         ])
 
         return M_rigid + M_added
+
+    # ─── Frequência-Dependência Hidrodinâmica ───────────────
+
+    def _get_frequency_dependent_added_mass(self, freq: float) -> np.ndarray:
+        """Retorna coeficientes de massa adicionada frequência-dependente (diagonal).
+        
+        Modelo aproximado: M_added(f) escala suavemente com frequência.
+        Para baixas freqs (~0.1 Hz): M_added ≈ coeff base
+        Para altas freqs (~1+ Hz): M_added reduz (~0.5 * coeff base)
+        
+        Baseado em dados hidrodinâmicos típicos para corpos submersos.
+        """
+        freq = max(0.01, float(freq))
+        # escala suave: função decrescente
+        scale = 1.0 / (1.0 + 0.5 * freq)  # em Hz
+        added_mass_diag = np.array([self.coeff.X_udot, self.coeff.Y_vdot, self.coeff.Z_wdot])
+        return added_mass_diag * np.maximum(0.3, scale)  # mínimo 30% da base
+
+    def _get_frequency_dependent_damping(self, freq: float) -> np.ndarray:
+        """Retorna coeficientes de amortecimento viscoso frequência-dependente (diagonal).
+        
+        Modelo: amortecimento aumenta com frequência (skin friction + wave drag).
+        """
+        freq = max(0.01, float(freq))
+        # escala crescente com frequência
+        scale = 1.0 + 0.3 * freq  # em Hz
+        # usa diagonal de matriz de arrasto como base (X_vv, Y_vv, Z_ww aproximações)
+        # nota: para simplicidade, usa coefs de massa como proxy (poderiam ser dados experimentais)
+        base_damping = np.array([self.coeff.X_udot, self.coeff.Y_vdot, self.coeff.Z_wdot]) * 0.5
+        return base_damping * scale
 
     # ─── Equações de Fossen ──────────────────
 
@@ -548,12 +617,77 @@ class PhysicsEngine:
 
         J   = self._jacobian(eta)
         C   = self._coriolis_matrix(nu)
-        D   = self._drag_matrix(nu)
+        # aplica corrente/turbulência modificando a velocidade relativa usada no arrasto
+        nu_for_drag = nu.copy()
+        # apenas o bloco linear é afetado pela corrente
+        nu_for_drag[0:3] = nu[0:3] - self._env_current_body
+
+        D   = self._drag_matrix(nu_for_drag)
         g   = self._restoring_forces(eta)
         tau = self.thruster_port.wrench_body + self.thruster_starboard.wrench_body
 
+        # aumenta efeito do arrasto com turbulência
+        if self._env_turbulence > 0.0:
+            D = D * (1.0 + float(self._env_turbulence))
+
+        # componente oscilatória simplificada representando forças de onda
+        try:
+            amp = float(self._env_turbulence) * float(self.env_turbulence_gain)
+        except Exception:
+            amp = float(self._env_turbulence)
+
+        if amp > 0.0:
+            freq = float(getattr(self, 'env_wave_freq', 0.8))
+            phase = float(getattr(self, '_env_wave_phase', 0.0))
+            v_wave = amp * np.sin(2.0 * np.pi * freq * self._time + phase)
+            # direção da oscilação: mesma direção da corrente se houver, senão surge
+            dir_norm = np.linalg.norm(self._env_current_body)
+            if dir_norm > 1e-6:
+                dir_vec = self._env_current_body / dir_norm
+            else:
+                dir_vec = np.array([1.0, 0.0, 0.0])
+
+            v_wave_vec = v_wave * dir_vec
+            # usa coeficientes quadráticos para escalonar a força de onda (approx.)
+            quad = np.array([
+                self.coeff.X_uu, self.coeff.Y_vv, self.coeff.Z_ww
+            ])
+            F_wave = -quad * np.abs(v_wave_vec) * v_wave_vec
+            F_wave = F_wave * float(getattr(self, 'env_force_gain', 1.0))
+            # adiciona apenas as forças (não momentos) geradas pela onda
+            tau = tau + np.concatenate([F_wave, np.zeros(3)])
+
+        # efeito de massa adicionada + amortecimento dinâmicos (frequência-dependentes via harmônicos)
+        added_mass_diag = np.array([self.coeff.X_udot, self.coeff.Y_vdot, self.coeff.Z_wdot])
+        F_added = np.zeros(3)
+        F_damping = np.zeros(3)
+        if getattr(self, '_env_harmonics_body', None) is not None:
+            freqs, amps, phases, dirs_body = self._env_harmonics_body
+            t = self._time
+            for f, A, ph, d in zip(freqs, amps, phases, dirs_body):
+                omega = 2.0 * np.pi * float(f)
+                # aceleração do fluido: a_h = omega * A * cos(omega t + phase)
+                a_h = omega * A * np.cos(omega * t + float(ph))
+                # velocidade orbital: v_h = A * sin(omega t + phase)
+                v_h = A * np.sin(omega * t + float(ph))
+                # massa adicionada dependente de frequência
+                M_f = self._get_frequency_dependent_added_mass(f)
+                # amortecimento dependente de frequência
+                C_f = self._get_frequency_dependent_damping(f)
+                # forças por harmônico
+                F_added += - M_f * (a_h * d) * float(getattr(self, 'env_force_gain', 1.0))
+                F_damping += - C_f * (v_h * d) * float(getattr(self, 'env_turbulence_gain', 1.0))
+        else:
+            env_dt = max(1e-6, float(getattr(self, '_env_dt', 1e-6)))
+            a_fluid = (self._env_current_body - self._prev_env_current_body) / env_dt
+            M_f = self._get_frequency_dependent_added_mass(0.5)  # fallback freq
+            F_added = - M_f * a_fluid * float(getattr(self, 'env_force_gain', 1.0))
+
+        # aplica forças (X,Y,Z)
+        tau = tau + np.concatenate([F_added + F_damping, np.zeros(3)])
+
         eta_dot = J @ nu
-        nu_dot  = self._M_inv @ (tau - C @ nu - D @ nu - g)
+        nu_dot  = self._M_inv @ (tau - C @ nu - D @ nu_for_drag - g)
 
         return eta_dot, nu_dot
 
