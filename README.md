@@ -3,7 +3,7 @@ USV Digital Twin — Naval Autonomy via Hierarchical Reinforcement Learning
 
 ![Status](https://img.shields.io/badge/Status-Em%20Desenvolvimento-orange)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+![License](https://img.shields.io/badge/License-GNU-green)
 
 This repository contains a high-fidelity Digital Twin framework for an Autonomous Surface Vehicle (USV). The project integrates advanced hydrodynamic modeling, statistical sensor fusion, and Artificial Intelligence to solve autonomous navigation challenges in noisy maritime environments.
 
