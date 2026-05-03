@@ -542,10 +542,10 @@ class PhysicsEngine:
         u, v, w = nu[0], nu[1], nu[2]
         p, q, r = nu[3], nu[4], nu[5]
 
-        # massa total por eixo (rígida + adicionada)
-        m11 = m + c.X_udot
-        m22 = m + c.Y_vdot
-        m33 = m + c.Z_wdot
+        # usa uma massa translacional única no acoplamento de Coriolis.
+        # Isso preserva o cancelamento físico em translação pura e evita
+        # torque espúrio em pitch/roll por diferenças entre eixos.
+        m_trans = m
         m44 = 0.5*m*R**2         + c.K_pdot
         m55 = (1/12)*m*(3*R**2+L**2) + c.M_qdot
         m66 = m55                + c.N_rdot
@@ -553,14 +553,14 @@ class PhysicsEngine:
         C = np.zeros((6, 6))
 
         # bloco superior direito
-        C[0, 3] =  0;        C[0, 4] =  m33*w;   C[0, 5] = -m22*v
-        C[1, 3] = -m33*w;   C[1, 4] =  0;        C[1, 5] =  m11*u
-        C[2, 3] =  m22*v;   C[2, 4] = -m11*u;    C[2, 5] =  0
+        C[0, 3] =  0;         C[0, 4] =  m_trans*w;  C[0, 5] = -m_trans*v
+        C[1, 3] = -m_trans*w; C[1, 4] =  0;          C[1, 5] =  m_trans*u
+        C[2, 3] =  m_trans*v; C[2, 4] = -m_trans*u;  C[2, 5] =  0
 
         # bloco inferior esquerdo (transposto negativo)
-        C[3, 0] =  0;        C[3, 1] =  m33*w;   C[3, 2] = -m22*v
-        C[4, 0] = -m33*w;   C[4, 1] =  0;        C[4, 2] =  m11*u
-        C[5, 0] =  m22*v;   C[5, 1] = -m11*u;    C[5, 2] =  0
+        C[3, 0] =  0;         C[3, 1] =  m_trans*w;  C[3, 2] = -m_trans*v
+        C[4, 0] = -m_trans*w; C[4, 1] =  0;          C[4, 2] =  m_trans*u
+        C[5, 0] =  m_trans*v; C[5, 1] = -m_trans*u;  C[5, 2] =  0
 
         # bloco inferior direito
         C[3, 4] =  m66*r;   C[3, 5] = -m55*q

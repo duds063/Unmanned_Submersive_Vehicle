@@ -820,7 +820,7 @@ class N3Agent:
     """Nível 3 — Navegação por waypoints."""
 
     MAX_WAYPOINTS = 5
-    OBS_DIM       = 12 + MAX_WAYPOINTS * 3   # ekf_state(12) + waypoints(15)
+    OBS_DIM       = 12 + MAX_WAYPOINTS * 3 + 3   # ekf_state(12) + waypoints(15) + vision(3)
     ACTION_DIM    = 13                         # setpoint pra N2
 
     def __init__(self, lr: float = 3e-4):
@@ -836,10 +836,11 @@ class N3Agent:
         self.current_wp_idx = 0
         self.waypoint_threshold = 0.5   # m — raio de chegada
 
-    def set_waypoints(self, waypoints: List[np.ndarray]) -> None:
+    def set_waypoints(self, waypoints: List[np.ndarray], waypoint_threshold: float = 0.5) -> None:
         assert len(waypoints) <= self.MAX_WAYPOINTS
         self.waypoints      = waypoints
         self.current_wp_idx = 0
+        self.waypoint_threshold = float(waypoint_threshold)
 
     def get_observation(self, ekf_state) -> np.ndarray:
         """Estado EKF + waypoints (com padding se < MAX_WAYPOINTS)."""
@@ -851,7 +852,12 @@ class N3Agent:
         for i, wp in enumerate(remaining[:self.MAX_WAYPOINTS]):
             wp_vec[i*3:(i+1)*3] = wp
 
-        return np.concatenate([state_vec, wp_vec])
+        # vision relative waypoint (world-frame delta) — pad zeros if unavailable
+        vis = np.zeros(3)
+        if getattr(ekf_state, "vision_relative_waypoint", None) is not None:
+            vis = np.asarray(ekf_state.vision_relative_waypoint, dtype=float)
+
+        return np.concatenate([state_vec, wp_vec, vis])
 
     def check_waypoint_reached(self, position: np.ndarray) -> bool:
         """Verifica se waypoint atual foi atingido."""
@@ -872,6 +878,20 @@ class N3Agent:
     @property
     def mission_complete(self) -> bool:
         return self.current_wp_idx >= len(self.waypoints)
+
+    @property
+    def next_waypoint(self) -> Optional[np.ndarray]:
+        next_idx = self.current_wp_idx + 1
+        if next_idx < len(self.waypoints):
+            return self.waypoints[next_idx]
+        return None
+
+    @property
+    def previous_waypoint(self) -> Optional[np.ndarray]:
+        prev_idx = self.current_wp_idx - 1
+        if prev_idx >= 0 and prev_idx < len(self.waypoints):
+            return self.waypoints[prev_idx]
+        return None
 
     def act(self, obs: np.ndarray, update_obs_stats: bool = True):
         return self.network.act(obs, update_obs_stats=update_obs_stats)
@@ -931,6 +951,7 @@ class HRLController:
         self.n3 = N3Agent()
         self.reward_fn   = RewardFunction()
         self.checkpoint_dir = checkpoint_dir
+        self._control_engine = None  # set by benchmark or integration code for waypoint detection
         self._phase = 1
         self._set_phase(1)
 
@@ -954,8 +975,8 @@ class HRLController:
         self._set_phase(phase)
         print(f"✓ HRL fase {phase}: {self.PHASES[phase]}")
 
-    def set_waypoints(self, waypoints: List[np.ndarray]) -> None:
-        self.n3.set_waypoints(waypoints)
+    def set_waypoints(self, waypoints: List[np.ndarray], waypoint_threshold: float = 0.5) -> None:
+        self.n3.set_waypoints(waypoints, waypoint_threshold=waypoint_threshold)
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
@@ -1072,6 +1093,7 @@ class HRLController:
         training: bool = False,
         forced_done: bool = False,
         return_info: bool = False,
+        navigation_position=None,
     ):
         """
         Computa ação hierárquica.
@@ -1084,6 +1106,7 @@ class HRLController:
         from control_engine import ControlCommand
 
         position = ekf_state.position
+        nav_position = np.asarray(position if navigation_position is None else navigation_position, dtype=float)
 
         # ── N3 — Navegação ────────────────────
         obs_n3 = self.n3.get_observation(ekf_state)
@@ -1096,7 +1119,7 @@ class HRLController:
         waypoint_before = self.n3.current_waypoint
 
         # verifica se o waypoint foi atingido neste passo
-        reached = self.n3.check_waypoint_reached(position)
+        reached = self.n3.check_waypoint_reached(nav_position)
 
         # recompensa N3
         if waypoint_before is not None:
@@ -1158,10 +1181,37 @@ class HRLController:
             ekf_state=ekf_state,
             sonar_readings=sonar_readings,
         )
-        from control_engine import GuidanceGains, guidance_to_dual_thruster_command
+        from control_engine import GuidanceGains, guidance_to_dual_thruster_command, path_guidance_target
 
         wp = self.n3.current_waypoint
-        target = np.asarray(wp if wp is not None else position, dtype=float).copy()
+        next_wp = self.n3.next_waypoint
+        if wp is not None:
+            target, desired_yaw = path_guidance_target(
+                position=nav_position,
+                previous_waypoint=(None if self.n3.previous_waypoint is None else np.asarray(self.n3.previous_waypoint, dtype=float)),
+                current_waypoint=np.asarray(wp, dtype=float),
+                next_waypoint=(None if next_wp is None else np.asarray(next_wp, dtype=float)),
+                desired_depth=float(wp[2]),
+                gains=GuidanceGains(
+                    k_forward=0.28,
+                    k_surge_damp=0.36,
+                    k_yaw=0.92,
+                    k_lateral=0.16,
+                    k_yaw_damp=0.42,
+                    k_depth=0.15,
+                    k_heave_damp=0.11,
+                    k_ballast=0.18,
+                    k_ballast_damp=0.08,
+                    max_forward_power=0.28,
+                    max_reverse_power=0.40,
+                    max_yaw_diff=0.22,
+                    max_theta_deg=22.0,
+                    depth_deadband_m=0.14,
+                ),
+            )
+        else:
+            target = np.asarray(position, dtype=float).copy()
+            desired_yaw = float(ekf_state.orientation[2])
 
         front = float(sonar_dists[0]) if len(sonar_dists) > 0 else SONAR_RANGE_MAX
         aft   = float(sonar_dists[1]) if len(sonar_dists) > 1 else SONAR_RANGE_MAX
@@ -1184,14 +1234,12 @@ class HRLController:
         if front_close > 0.05:
             target[2] += 0.25 * float(fused_action[1])
 
-        horizontal_delta = target[:2] - np.asarray(position[:2], dtype=float)
-        desired_yaw = float(np.arctan2(horizontal_delta[1], horizontal_delta[0])) if np.linalg.norm(horizontal_delta) > 1e-6 else yaw
         cmd = guidance_to_dual_thruster_command(
             ekf_state=ekf_state,
             target_position=target,
             desired_yaw=desired_yaw,
             gains=GuidanceGains(
-                k_forward=0.60,
+                k_forward=0.28,
                 k_surge_damp=0.36,
                 k_yaw=0.92,
                 k_lateral=0.16,
@@ -1200,7 +1248,7 @@ class HRLController:
                 k_heave_damp=0.11,
                 k_ballast=0.18,
                 k_ballast_damp=0.08,
-                max_forward_power=0.72,
+                max_forward_power=0.28,
                 max_reverse_power=0.40,
                 max_yaw_diff=0.22,
                 max_theta_deg=22.0,
@@ -1292,6 +1340,7 @@ def integrate_rl(control_engine, checkpoint_dir: str = './checkpoints') -> HRLCo
             print("  Nenhum checkpoint válido — iniciando do zero.")
 
     control_engine._rl = hrl
+    hrl._control_engine = control_engine  # enable waypoint detection in HRL
     print("✓ HRL Controller integrado ao ControlEngine.")
     return hrl
 

@@ -62,6 +62,7 @@ class IMUReading:
     accel: np.ndarray   # [ax, ay, az] m/s²
     gyro:  np.ndarray   # [p, q, r] rad/s
     timestamp: float
+    velocity: Optional[np.ndarray] = None  # [u, v, w] m/s — DVL sintético / odometria corporal
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +128,7 @@ class EKFState:
     nu:        np.ndarray           # [u,v,w,p,q,r] — velocidades
     P:         np.ndarray           # covariância 12x12
     timestamp: float
+    vision_relative_waypoint: Optional[np.ndarray] = None
 
     @property
     def position(self) -> np.ndarray:
@@ -207,6 +209,8 @@ class Environment:
     """Ambiente de simulação — contém obstáculos e limites."""
 
     def __init__(self, pool_depth: float = 20.0, pool_radius: float = 50.0):
+        self.pool_depth = pool_depth
+        self.pool_radius = pool_radius
         self.obstacles: List[Obstacle] = []
         self._setup_boundaries(pool_depth, pool_radius)
 
@@ -355,6 +359,51 @@ class SensorEngine:
             barometer=barometer,
             timestamp=time,
         )
+
+    def detect_waypoint(
+        self,
+        state: VehicleState,
+        waypoint_world: np.ndarray,
+        time: float,
+        max_range: float = 100.0,
+        fov_deg: float = 60.0,
+        noise_std: float = 0.05,
+        dropout_prob: float = 0.05,
+    ) -> Optional[np.ndarray]:
+        """Simula um detector visual que retorna o vetor relativo ao waypoint
+        no referencial do corpo (body frame) quando detectado.
+
+        Retorna None em caso de não detecção.
+        """
+        # posição do veículo e vetor para o waypoint no referencial mundo
+        pos = np.array([state.x, state.y, state.z], dtype=float)
+        wp = np.array(waypoint_world, dtype=float)
+        vec_world = wp - pos
+        dist = float(np.linalg.norm(vec_world))
+        if dist <= 0 or dist > max_range:
+            return None
+
+        # orientação veículo -> rotação do body para world
+        R = self._rotation_matrix(state.phi, state.tht, state.psi)
+        vec_body = R.T @ vec_world
+
+        # checa FOV (azimuth/elevation)
+        x, y, z = vec_body
+        az = float(np.arctan2(y, x))
+        el = float(np.arctan2(z, np.sqrt(x * x + y * y) + 1e-9))
+        half_fov = np.radians(fov_deg) / 2.0
+        if abs(az) > half_fov or abs(el) > half_fov:
+            return None
+
+        # dropout simula oclusões / perdas de detecção
+        if self.rng.random() < dropout_prob:
+            return None
+
+        # ruído gaussiano proporcional à distância
+        noise = self.rng.normal(0.0, noise_std * max(1.0, dist * 0.02), size=3)
+        meas = vec_body + noise
+        # saturate small values
+        return meas
 
     def set_noise_scale(self, scale: float) -> None:
         """Ajusta nível de ruído em runtime — útil pra domain randomization."""
@@ -555,6 +604,7 @@ class SensorEngine:
 
         # velocidades angulares verdadeiras
         true_gyro = np.array([state.p, state.q, state.r])
+        true_velocity = body_vel.copy()
 
         # drift do bias
         self._accel_bias += self.rng.normal(
@@ -565,6 +615,7 @@ class SensorEngine:
         # ruído branco
         accel_noise = self.rng.normal(0, IMU_ACCEL_NOISE_STD * self.noise_scale, 3)
         gyro_noise  = self.rng.normal(0, IMU_GYRO_NOISE_STD  * self.noise_scale, 3)
+        velocity_noise = self.rng.normal(0, 0.03 * self.noise_scale, 3)
 
         # componente não gaussiana (maresia/turbulência)
         if self.enable_rayleigh and self.environment_scale > 0.0:
@@ -574,8 +625,9 @@ class SensorEngine:
         # leitura ruidosa
         accel_meas = linear_accel_body + g_body + self._accel_bias + accel_noise
         gyro_meas  = true_gyro   + self._gyro_bias  + gyro_noise
+        velocity_meas = true_velocity + velocity_noise
 
-        return IMUReading(accel=accel_meas, gyro=gyro_meas, timestamp=time)
+        return IMUReading(accel=accel_meas, gyro=gyro_meas, velocity=velocity_meas, timestamp=time)
 
     # ─── Sonar ───────────────────────────────
 
@@ -738,15 +790,17 @@ class ExtendedKalmanFilter:
             0.001, 0.001, 0.001, # velocidade angular
         ])
 
-    def __init__(self, physics: PhysicsEngine):
+    def __init__(self, physics: PhysicsEngine, pool_radius: float = 50.0, pool_depth: float = 10.0):
         self.physics = physics
+        self.pool_radius = pool_radius
+        self.pool_depth = pool_depth
 
         # covariâncias de processo — quanta incerteza adicionamos por step
         self.Q = np.diag([
-            0.01, 0.01, 0.01,   # posição xyz
-            0.005, 0.005, 0.005, # orientação euler
-            0.1,  0.1,  0.1,    # velocidade linear
-            0.05, 0.05, 0.05,   # velocidade angular
+            0.0005, 0.0005, 0.0005,  # posição xyz
+            0.0010, 0.0010, 0.0010,  # orientação euler
+            0.02,   0.02,   0.02,    # velocidade linear
+            0.01,   0.01,   0.01,    # velocidade angular
         ])
 
         # covariâncias de medição
@@ -761,14 +815,27 @@ class ExtendedKalmanFilter:
 
         self._time = 0.0
         self._last_imu_timestamp: Optional[float] = None
+        # vision support
+        self.R_vision = np.eye(3) * 0.2**2
+        self._vision_last: Optional[np.ndarray] = None
 
     @property
     def state_estimate(self) -> EKFState:
+        # convert last vision measurement (body frame) to world-frame delta if present
+        vis = None
+        if self._vision_last is not None:
+            phi, tht, psi = float(self._x[3]), float(self._x[4]), float(self._x[5])
+            R = SensorEngine._rotation_matrix(phi, tht, psi)
+            # body->world
+            vis_world = R @ self._vision_last
+            vis = vis_world.copy()
+
         return EKFState(
             eta=self._x[:6].copy(),
             nu=self._x[6:].copy(),
             P=self._P.copy(),
             timestamp=self._time,
+            vision_relative_waypoint=vis,
         )
 
     def predict(self, dt: float) -> None:
@@ -857,21 +924,94 @@ class ExtendedKalmanFilter:
         Rg = np.diag([IMU_GYRO_NOISE_STD**2] * 3)
         self._update(z, h, H, Rg)
 
+        # velocidade corporal sintética: corrige o drift horizontal do dead reckoning
+        if reading.velocity is not None:
+            z_v = reading.velocity.astype(float)
+            h_v = self._x[6:9].copy()
+            H_v = np.zeros((3, self.DIM_STATE))
+            H_v[0, 6] = 1.0
+            H_v[1, 7] = 1.0
+            H_v[2, 8] = 1.0
+            Rv = np.diag([0.01**2] * 3)
+            self._update(z_v, h_v, H_v, Rv)
+
     def update_sonar(self, readings: List[SonarReading]) -> None:
-        """Atualiza com leituras do sonar — só usa hits válidos."""
+        """Atualiza com leituras do sonar - usa hits válidos de cima/baixo e horizontais."""
         hits = [r for r in readings if r.hit]
         if not hits:
             return
 
-        # Usa apenas o sonar apontado para cima como medida de profundidade.
-        # O sonar para baixo enxerga o fundo e não deve ser confundido com z.
         for reading in hits:
             if np.allclose(reading.direction, [0, 0, -1]):
                 z = np.array([reading.distance])
-                h = np.array([self._x[2]])  # z estimado
+                h = np.array([self._x[2]])
                 H = np.zeros((1, self.DIM_STATE))
                 H[0, 2] = 1.0
                 self._update(z, h, H, self.R_sonar[:1, :1])
+
+    def _ray_circle_distance(self, position_xy: np.ndarray, direction_xy: np.ndarray, radius: float) -> Optional[float]:
+        direction_xy = direction_xy / (np.linalg.norm(direction_xy) + 1e-12)
+        px, py = float(position_xy[0]), float(position_xy[1])
+        dx, dy = float(direction_xy[0]), float(direction_xy[1])
+        b = px * dx + py * dy
+        c = px * px + py * py - radius * radius
+        disc = b * b - c
+        if disc < 0.0:
+            return None
+        root = np.sqrt(disc)
+        candidates = [t for t in (-b - root, -b + root) if t > SONAR_MIN_RANGE]
+        return min(candidates) if candidates else None
+
+    def update_sonar_position(self, readings: List[SonarReading]) -> None:
+        """Use horizontal sonar hits against the pool boundary to weakly constrain x/y."""
+        if not readings or self.pool_radius <= 0:
+            return
+
+        position_xy = self._x[:2].copy()
+        yaw = float(self._x[5])
+        cpsi = np.cos(yaw)
+        spsi = np.sin(yaw)
+        rotation = np.array([
+            [cpsi, -spsi, 0.0],
+            [spsi,  cpsi, 0.0],
+            [0.0,   0.0,  1.0],
+        ])
+
+        for reading in readings:
+            if not reading.hit:
+                continue
+            if np.allclose(reading.direction, [0, 0, 1]) or np.allclose(reading.direction, [0, 0, -1]):
+                continue
+
+            world_direction = rotation @ reading.direction
+            expected_distance = self._ray_circle_distance(position_xy, world_direction[:2], self.pool_radius)
+            if expected_distance is None:
+                continue
+
+            z = np.array([reading.distance], dtype=float)
+            h = np.array([expected_distance], dtype=float)
+            H = np.zeros((1, self.DIM_STATE))
+            eps = 1e-4
+            for idx in (0, 1, 5):
+                x_perturbed = self._x.copy()
+                x_perturbed[idx] += eps
+                pos_perturbed = x_perturbed[:2]
+                yaw_perturbed = float(x_perturbed[5])
+                cpsi_p = np.cos(yaw_perturbed)
+                spsi_p = np.sin(yaw_perturbed)
+                rotation_p = np.array([
+                    [cpsi_p, -spsi_p, 0.0],
+                    [spsi_p,  cpsi_p, 0.0],
+                    [0.0,     0.0,    1.0],
+                ])
+                world_direction_p = rotation_p @ reading.direction
+                expected_p = self._ray_circle_distance(pos_perturbed, world_direction_p[:2], self.pool_radius)
+                if expected_p is None:
+                    continue
+                H[0, idx] = (expected_p - expected_distance) / eps
+
+            R_pos = np.array([[0.25**2]])
+            self._update(z, h, H, R_pos)
 
     def update_barometer(self, reading: BarometerReading) -> None:
         """Atualiza profundidade z com barômetro."""
@@ -881,28 +1021,64 @@ class ExtendedKalmanFilter:
         H[0, 2] = 1.0
         self._update(z, h, H, self.R_baro)
 
+    def _h_vision(self, x: np.ndarray, waypoint_world: np.ndarray) -> np.ndarray:
+        """Modelo de observação para visão: vetor relativo no referencial do corpo.
+
+        h(x) = R_body_world^T * (wp_world - position_world)
+        Retorna vetor 3x1 no corpo.
+        """
+        pos = x[:3]
+        phi, theta, psi = x[3], x[4], x[5]
+        R = SensorEngine._rotation_matrix(phi, theta, psi)
+        vec_world = np.array(waypoint_world, dtype=float) - pos
+        return R.T @ vec_world
+
+    def update_vision(self, reading: Optional[np.ndarray], waypoint_world: np.ndarray, R_cov: Optional[np.ndarray] = None) -> None:
+        """Atualiza EKF com medição visual do vetor relativo no body frame.
+
+        reading: None ou vetor 3D em body frame.
+        waypoint_world: posição do waypoint no referencial mundo (3,).
+        """
+        self._vision_last = None if reading is None else reading.astype(float)
+        if reading is None:
+            return
+
+        z = reading.astype(float)
+        # monta h(x)
+        h = self._h_vision(self._x, waypoint_world)
+
+        # numeric Jacobian 3x12
+        H = np.zeros((3, self.DIM_STATE))
+        eps = 1e-4
+        for idx in range(self.DIM_STATE):
+            x_pert = self._x.copy()
+            x_pert[idx] += eps
+            h_pert = self._h_vision(x_pert, waypoint_world)
+            H[:, idx] = (h_pert - h) / eps
+
+        R = self.R_vision if R_cov is None else np.asarray(R_cov, dtype=float)
+        if R.shape != (3, 3):
+            R = np.eye(3) * float(R)
+
+        self._update(z, h, H, R)
+
     # ─── EKF internals ───────────────────────
 
     def _f(self, x: np.ndarray, dt: float) -> np.ndarray:
-        """Modelo de processo — cinemática de corpo rígido simplificada."""
+        """Modelo de processo - cinemática de corpo rígido simplificada."""
         eta = x[:6]
-        nu  = x[6:]
-
+        nu = x[6:]
         J = self._jacobian_eta(eta)
         eta_dot = J @ nu
-
         x_new = x.copy()
         x_new[:6] += eta_dot * dt
-        # velocidades mantidas constantes na predição (sem modelo de força)
-        # o Physics Engine é a fonte de verdade — EKF só filtra
-
         return x_new
 
     def _compute_F(self, x: np.ndarray, dt: float) -> np.ndarray:
         """Jacobiana do modelo de processo 12x12."""
         F = np.eye(self.DIM_STATE)
         eta = x[:6]
-        J   = self._jacobian_eta(eta)
+        J = self._jacobian_eta(eta)
         F[:6, 6:] = J * dt
         return F
 
@@ -911,52 +1087,45 @@ class ExtendedKalmanFilter:
         phi, theta = x[3], x[4]
         g_body = np.array([
             -G * np.sin(theta),
-             G * np.cos(theta) * np.sin(phi),
-             G * np.cos(theta) * np.cos(phi),
+            G * np.cos(theta) * np.sin(phi),
+            G * np.cos(theta) * np.cos(phi),
         ])
         return np.concatenate([g_body, x[9:12]])
 
     def _H_imu(self, x: np.ndarray) -> np.ndarray:
         """Jacobiana do modelo de observação do IMU 6x12."""
         H = np.zeros((6, self.DIM_STATE))
-        # aceleração depende de phi (idx 3) e theta (idx 4)
         phi, theta = x[3], x[4]
         H[0, 4] = -G * np.cos(theta)
-        H[1, 3] =  G * np.cos(theta) * np.cos(phi)
+        H[1, 3] = G * np.cos(theta) * np.cos(phi)
         H[1, 4] = -G * np.sin(theta) * np.sin(phi)
         H[2, 3] = -G * np.cos(theta) * np.sin(phi)
         H[2, 4] = -G * np.sin(theta) * np.cos(phi)
-        # giroscópio observa diretamente p,q,r (idx 9,10,11)
-        H[3, 9]  = 1.0
+        H[3, 9] = 1.0
         H[4, 10] = 1.0
         H[5, 11] = 1.0
         return H
 
-    def _update(
-        self,
-        z: np.ndarray,
-        h: np.ndarray,
-        H: np.ndarray,
-        R: np.ndarray
-    ) -> None:
+    def _update(self, z: np.ndarray, h: np.ndarray, H: np.ndarray, R: np.ndarray) -> None:
         """Etapa de atualização EKF padrão."""
-        innov = z - h                           # inovação
-        S     = H @ self._P @ H.T + R          # covariância da inovação
-        K     = self._P @ H.T @ np.linalg.inv(S)  # ganho de Kalman
+        innov = z - h
+        S = H @ self._P @ H.T + R
+        K = self._P @ H.T @ np.linalg.inv(S)
         self._x = self._x + K @ innov
         self._P = (np.eye(self.DIM_STATE) - K @ H) @ self._P
 
     def _jacobian_eta(self, eta: np.ndarray) -> np.ndarray:
-        """Bloco J1 da Jacobiana — transforma nu em eta_dot."""
+        """Bloco J1 da Jacobiana - transforma nu em eta_dot."""
         phi, theta, psi = eta[3], eta[4], eta[5]
         R = SensorEngine._rotation_matrix(phi, theta, psi)
-        cphi=np.cos(phi); sphi=np.sin(phi)
-        cth=np.cos(theta)
-        tth=np.tan(theta)
+        cphi = np.cos(phi)
+        sphi = np.sin(phi)
+        cth = np.cos(theta)
+        tth = np.tan(theta)
         T = np.array([
-            [1, sphi*tth,  cphi*tth],
-            [0, cphi,     -sphi    ],
-            [0, sphi/cth,  cphi/cth]
+            [1.0, sphi * tth, cphi * tth],
+            [0.0, cphi, -sphi],
+            [0.0, sphi / (cth + 1e-12), cphi / (cth + 1e-12)],
         ])
         J = np.zeros((6, 6))
         J[:3, :3] = R
@@ -964,10 +1133,11 @@ class ExtendedKalmanFilter:
         return J
 
     def reset(self, initial_state: Optional[np.ndarray] = None) -> None:
-        self._x = initial_state if initial_state is not None else np.zeros(self.DIM_STATE)
+        self._x = initial_state.copy() if initial_state is not None else np.zeros(self.DIM_STATE)
         self._P = self._initial_covariance()
         self._time = 0.0
         self._last_imu_timestamp = None
+        self._vision_last = None
 
 
 # ─────────────────────────────────────────────
@@ -980,58 +1150,50 @@ if __name__ == "__main__":
 
     print("Inicializando Sensor Engine + EKF...")
 
-    # setup
-    geo     = GeometryEngine(L=0.8, D=0.1)
+    geo = GeometryEngine(L=0.8, D=0.1)
     physics = PhysicsEngine(geo, max_thruster_force=10.0)
 
-    env     = Environment(pool_depth=5.0, pool_radius=30.0)   # pool de 5m — fundo atingível
-    env.add_sphere(np.array([5.0, 0.0, 3.0]), radius=1.0)   # obstáculo esférico
+    env = Environment(pool_depth=5.0, pool_radius=30.0)
+    env.add_sphere(np.array([5.0, 0.0, 3.0]), radius=1.0)
 
     sensors = SensorEngine(env, noise_scale=1.0)
-    ekf     = ExtendedKalmanFilter(physics)
+    ekf = ExtendedKalmanFilter(physics, pool_radius=env.pool_radius, pool_depth=env.pool_depth)
 
-    # Teste 1 — leitura de sensores em repouso
-    print("\nTeste 1 — Sensores em repouso:")
+    print("\nTeste 1 - Sensores em repouso:")
     bundle = sensors.read(physics.state, 0.0)
     print(f"  IMU accel: {bundle.imu.accel.round(3)}")
     print(f"  IMU gyro:  {bundle.imu.gyro.round(4)}")
     print(f"  Barômetro: {bundle.barometer.depth:.3f} m")
     print(f"  Sonar hits: {sum(1 for s in bundle.sonar if s.hit)}/6")
 
-    # Teste 2 — sonar detecta fundo
-    print("\nTeste 2 — Sonar detecta fundo a 10m:")
-    state_deep = VehicleState(z=2.0)  # 2m de profundidade
+    print("\nTeste 2 - Sonar detecta fundo a 10m:")
+    state_deep = VehicleState(z=2.0)
     bundle2 = sensors.read(state_deep, 0.1)
+    dir_name = ['frente', 'trás', 'estibordo', 'bombordo', 'baixo', 'cima']
     for s in bundle2.sonar:
-        dir_name = ['frente','trás','estibordo','bombordo','baixo','cima']
-        idx = list(range(6))[
-            [np.allclose(s.direction, d) for d in SensorEngine.SONAR_DIRECTIONS].index(True)
-        ]
+        idx = list(range(6))[[np.allclose(s.direction, d) for d in SensorEngine.SONAR_DIRECTIONS].index(True)]
         if s.hit:
             print(f"  {dir_name[idx]}: {s.distance:.2f}m (conf={s.confidence:.2f})")
         else:
             print(f"  {dir_name[idx]}: sem retorno")
 
-    # Teste 3 — EKF converge pro estado real
-    print("\nTeste 3 — EKF tracking por 3s:")
+    print("\nTeste 3 - EKF tracking por 3s:")
     physics.reset()
     ekf.reset()
     dt = 0.01
-
-    for i in range(300):
+    for _ in range(300):
         env_cur, env_turb = sensors.get_environmental_state()
         env_harm = sensors.get_environmental_harmonics()
         physics.step(0.3, 0.0, 0.0, 0.0, dt=dt, env_current_world=env_cur, env_turbulence=env_turb, env_harmonics=env_harm)
         bundle = sensors.read(physics.state, physics.time)
-
         ekf.predict(dt)
         ekf.update_imu(bundle.imu)
         ekf.update_barometer(bundle.barometer)
         ekf.update_sonar(bundle.sonar)
+        ekf.update_sonar_position(bundle.sonar)
 
-    real  = physics.state
-    est   = ekf.state_estimate
-
+    real = physics.state
+    est = ekf.state_estimate
     print(f"  Estado real:    x={real.x:.3f} z={real.z:.4f} u={real.u:.3f}")
     print(f"  Estado EKF:     x={est.eta[0]:.3f} z={est.eta[2]:.4f} u={est.nu[0]:.3f}")
     print(f"  Erro posição x: {abs(real.x - est.eta[0]):.4f} m")

@@ -35,8 +35,14 @@ from control_engine import (
     GuidanceGains,
     LQRWeights,
     SystemLinearizer,
+    body_frame_position_error,
     guidance_to_dual_thruster_command,
+    wrap_angle,
 )
+
+# Global tuning dictionary used by external scripts to steer MPC aggressiveness.
+# Example: import mpc_controller; mpc_controller.MPC_TUNING = {'max_cruise_mult':1.2}
+MPC_TUNING = {}
 
 
 # ─────────────────────────────────────────────
@@ -117,13 +123,21 @@ class MPCController:
         weights:     LQRWeights      = None,
         constraints: MPCConstraints  = None,
         hover_depth: float           = 2.0,
+        control_engine=None,  # optional reference to ControlEngine for waypoint detection
+        tuning: dict = None,
     ):
         self.physics     = physics_engine
+        self.control_engine = control_engine  # optional: allows terminal capture mode detection
         self.N           = horizon
         self.dt          = dt
         self.weights     = weights or LQRWeights()
         self.constraints = constraints or MPCConstraints()
         self.hover_depth = hover_depth
+        # tuning multipliers (can be overridden by external scripts via 'tuning' or module-level MPC_TUNING)
+        tuning = tuning or MPC_TUNING or {}
+        self.tune_max_cruise_mult = float(tuning.get('max_cruise_mult', 1.0))
+        self.tune_desired_surge_mult = float(tuning.get('desired_surge_mult', 1.0))
+        self.tune_base_power_gain_mult = float(tuning.get('base_power_gain_mult', 1.0))
 
         # dimensões
         self.nx = 12   # estados
@@ -175,30 +189,9 @@ class MPCController:
         import time as _time
 
         t_start = _time.time()
-        cmd = guidance_to_dual_thruster_command(
-            ekf_state=ekf_state,
-            target_position=self._x_ref[:3],
-            desired_yaw=float(self._x_ref[5]),
-            gains=GuidanceGains(
-                k_forward=0.60,
-                k_surge_damp=0.40,
-                k_yaw=0.95,
-                k_lateral=0.16,
-                k_yaw_damp=0.50,
-                k_depth=0.16,
-                k_heave_damp=0.13,
-                k_ballast=0.20,
-                k_ballast_damp=0.09,
-                max_forward_power=0.68,
-                max_reverse_power=0.52,
-                max_yaw_diff=0.32,
-                max_theta_deg=31.0,
-                depth_deadband_m=0.17,
-                heave_priority_ratio=0.65,
-            ),
-        )
+        cmd = self._bounded_navigation_command(ekf_state)
         self._solve_time = _time.time() - t_start
-        self._solve_status = 'guidance_allocator'
+        self._solve_status = 'bounded_navigation'
         u_opt = np.array([
             cmd.thruster_power,
             cmd.thruster_theta,
@@ -211,6 +204,91 @@ class MPCController:
         self._last_u_prev = u_opt
         self._last_cmd = cmd.clip()
         return self._last_cmd
+
+    def _bounded_navigation_command(self, ekf_state: EKFState) -> ControlCommand:
+        pos = np.asarray(ekf_state.position, dtype=float)
+        vel = np.asarray(ekf_state.velocity_linear, dtype=float)
+        ang = np.asarray(ekf_state.velocity_angular, dtype=float)
+        yaw = float(ekf_state.orientation[2])
+
+        target = np.asarray(self._x_ref[:3], dtype=float)
+        desired_yaw = float(self._x_ref[5])
+        # if vision provides a relative waypoint (world-frame delta), use it
+        if getattr(ekf_state, "vision_relative_waypoint", None) is not None:
+            delta_world = np.asarray(ekf_state.vision_relative_waypoint, dtype=float)
+        else:
+            delta_world = target - pos
+        err_body = body_frame_position_error(delta_world, yaw)
+        forward_err, lateral_err, depth_err = [float(v) for v in err_body]
+
+        horiz_dist = float(np.linalg.norm(delta_world[:2]))
+        surge = float(vel[0])
+        heave = float(vel[2])
+        yaw_rate = float(ang[2])
+        yaw_err = wrap_angle(desired_yaw - yaw)
+        abs_yaw_err = abs(yaw_err)
+
+        # Check if in terminal capture mode (near waypoint)
+        in_terminal_capture = (
+            self.control_engine is not None and 
+            self.control_engine.is_near_waypoint(pos, capture_radius_m=0.5)
+        )
+
+        # Forward speed is explicitly bounded by turn demand. Increase cruise
+        # speed a bit so MPC is more aggressive and matches LQR behavior.
+        max_cruise = 2.8 * float(getattr(self, 'tune_max_cruise_mult', 1.0))
+        speed_from_distance = max_cruise * float(np.tanh(horiz_dist / 2.8))
+        heading_scale = 0.08 + 0.92 * float(np.clip(np.cos(abs_yaw_err), 0.0, 1.0) ** 2.2)
+        desired_surge = speed_from_distance * heading_scale
+        # small boost for approach to avoid slow creeping
+        desired_surge *= 1.6 * float(getattr(self, 'tune_desired_surge_mult', 1.0))
+        if horiz_dist < 1.5:
+            desired_surge *= float(np.clip(horiz_dist / 1.5, 0.0, 1.0))
+        if abs_yaw_err > np.radians(85.0):
+            desired_surge *= 0.05
+
+        # Terminal capture mode: apply strong braking when near waypoint to prevent circling
+        if in_terminal_capture:
+            # Near the waypoint — reduce speed dramatically and increase depth control
+            desired_surge *= 0.15  # heavy braking near waypoint
+            depth_err *= 2.5       # amplify depth correction to settle at target z quickly
+
+        # If the target is behind the body axis, allow gentle reverse/braking.
+        if forward_err < -0.35:
+            desired_surge = min(desired_surge, -0.20 * float(np.tanh((-forward_err - 0.35) / 0.7)))
+
+        base_power = 0.9 * float(getattr(self, 'tune_base_power_gain_mult', 1.0)) * (desired_surge - surge) - 0.10 * np.tanh(surge / 0.45)
+        if abs_yaw_err > np.radians(45.0):
+            base_power -= 0.12 * float(np.tanh(surge / 0.35))
+        if abs(lateral_err) > 1.0:
+            lateral_scale = float(np.clip(abs(lateral_err) / 3.0, 0.0, 1.0))
+            base_power *= (1.0 - 0.35 * lateral_scale)
+        base_power = float(np.clip(base_power, -0.28, 0.24))
+
+        yaw_cmd = (
+            0.30 * float(np.tanh(lateral_err / 1.2))
+            + 1.05 * float(np.tanh(yaw_err / 0.9))
+            - 0.22 * yaw_rate
+        )
+        yaw_cmd = float(np.clip(yaw_cmd, -0.34, 0.34))
+
+        p1 = float(np.clip(base_power - yaw_cmd, -1.0, 1.0))
+        p2 = float(np.clip(base_power + yaw_cmd, -1.0, 1.0))
+
+        depth_cmd = 0.22 * float(np.tanh(depth_err / 1.2)) - 0.12 * heave
+        theta = float(np.clip(abs(depth_cmd), 0.0, np.radians(18.0)))
+        phi = float(np.pi / 2.0 if depth_cmd >= 0.0 else 3.0 * np.pi / 2.0) if theta > 1e-6 else 0.0
+        ballast = float(np.clip(0.18 * np.tanh(depth_err / 1.8) - 0.08 * heave, -1.0, 1.0))
+
+        return ControlCommand(
+            thruster_power=p1,
+            thruster_theta=theta,
+            thruster_phi=phi,
+            ballast_cmd=ballast,
+            thruster2_power=p2,
+            thruster2_theta=theta,
+            thruster2_phi=phi,
+        )
 
     @property
     def solve_time_ms(self) -> float:
@@ -362,12 +440,16 @@ def integrate_mpc(control_engine, hover_depth: float = 2.0) -> None:
         integrate_mpc(control)
         control.set_controller('mpc')
     """
+    # instantiate MPCController and pass through any global MPC_TUNING
+    tuning = globals().get('MPC_TUNING', {})
     mpc = MPCController(
         physics_engine=control_engine.physics,
         horizon=20,
         dt=0.1,
         weights=control_engine._lqr.weights,   # compartilha pesos com LQR
         hover_depth=hover_depth,
+        control_engine=control_engine,  # pass reference for waypoint detection
+        tuning=tuning,
     )
     control_engine._mpc = mpc
     print("✓ MPC inicializado e integrado ao ControlEngine.")

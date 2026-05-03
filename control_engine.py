@@ -144,18 +144,12 @@ class LQRWeights:
             self.r_ballast,
         ])
 
-    def update(self, **kwargs) -> None:
-        """Atualiza pesos em runtime — chamado pela GUI."""
-        for key, val in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, float(val))
-
-
 @dataclass
 class GuidanceGains:
     """Ganhos de guidance/alocação compatíveis com os atuadores reais."""
-    k_forward: float = 0.55
+    k_forward: float = 0.38
     k_surge_damp: float = 0.35
+    k_surge_brake: float = 0.28
     k_yaw: float = 0.85
     k_lateral: float = 0.14
     k_yaw_damp: float = 0.45
@@ -163,12 +157,21 @@ class GuidanceGains:
     k_heave_damp: float = 0.11
     k_ballast: float = 0.18
     k_ballast_damp: float = 0.08
-    max_forward_power: float = 0.65
+    max_forward_power: float = 0.38
     max_reverse_power: float = 0.45
     max_yaw_diff: float = 0.28
     max_theta_deg: float = 34.0
     depth_deadband_m: float = 0.18
     heave_priority_ratio: float = 0.65
+    path_lookahead_m: float = 2.4
+    path_heading_gain: float = 1.1
+    path_turn_speed_floor: float = 0.18
+    path_turn_speed_exp: float = 1.5
+    turn_forward_floor: float = 0.12
+    turn_forward_exp: float = 1.6
+    turn_brake_gain: float = 0.18
+    align_yaw_threshold_deg: float = 55.0
+    hard_turn_yaw_threshold_deg: float = 100.0
 
 
 def wrap_angle(angle: float) -> float:
@@ -184,11 +187,90 @@ def body_frame_position_error(delta_world: np.ndarray, yaw: float) -> np.ndarray
     return np.array([x_b, y_b, float(delta_world[2])], dtype=float)
 
 
+def path_guidance_target(
+    position: np.ndarray,
+    previous_waypoint: Optional[np.ndarray],
+    current_waypoint: np.ndarray,
+    next_waypoint: Optional[np.ndarray],
+    desired_depth: float,
+    gains: Optional[GuidanceGains] = None,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute a lookahead target and desired yaw for a waypoint segment.
+
+    If there is a next waypoint, follow the segment from current->next using
+    a carrot point ahead of the closest point on the segment. Otherwise fall
+    back to direct point pursuit of the current waypoint.
+    """
+    g = gains or GuidanceGains()
+    pos = np.asarray(position, dtype=float)
+    current = np.asarray(current_waypoint, dtype=float)
+    prev = None if previous_waypoint is None else np.asarray(previous_waypoint, dtype=float)
+    if prev is None:
+        delta = current[:2] - pos[:2]
+        desired_yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta) > 1e-6 else 0.0
+        target = current.copy()
+        target[2] = float(desired_depth)
+    else:
+        seg = current[:2] - prev[:2]
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-6:
+            delta = current[:2] - pos[:2]
+            desired_yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta) > 1e-6 else 0.0
+            target = current.copy()
+            target[2] = float(desired_depth)
+            return target, desired_yaw
+
+        seg_hat = seg / seg_len
+        rel = pos[:2] - prev[:2]
+        along = float(np.clip(np.dot(rel, seg_hat), 0.0, seg_len))
+        closest_xy = prev[:2] + along * seg_hat
+        remaining = seg_len - along
+        lookahead = min(float(g.path_lookahead_m), remaining)
+        carrot_xy = closest_xy + lookahead * seg_hat
+
+        crosstrack = float(seg_hat[0] * rel[1] - seg_hat[1] * rel[0])
+        seg_yaw = float(np.arctan2(seg_hat[1], seg_hat[0]))
+        heading_correction = float(np.arctan2(-g.path_heading_gain * crosstrack, max(0.5, lookahead)))
+        desired_yaw = wrap_angle(seg_yaw + heading_correction)
+
+        target = np.array([carrot_xy[0], carrot_xy[1], float(desired_depth)], dtype=float)
+
+    if next_waypoint is None:
+        return target, desired_yaw
+
+    nxt = np.asarray(next_waypoint, dtype=float)
+    dist_to_current = float(np.linalg.norm(current[:2] - pos[:2]))
+    if dist_to_current >= max(1.2, g.path_lookahead_m):
+        return target, desired_yaw
+
+    seg = nxt[:2] - current[:2]
+    seg_len = float(np.linalg.norm(seg))
+    if seg_len < 1e-6:
+        return target, desired_yaw
+
+    seg_hat = seg / seg_len
+    outgoing_yaw = float(np.arctan2(seg_hat[1], seg_hat[0]))
+    outgoing_lookahead = min(float(g.path_lookahead_m), seg_len)
+    outgoing_target = np.array([
+        current[0] + outgoing_lookahead * seg_hat[0],
+        current[1] + outgoing_lookahead * seg_hat[1],
+        float(desired_depth),
+    ], dtype=float)
+
+    blend = float(np.clip(1.0 - dist_to_current / max(1.2, g.path_lookahead_m), 0.0, 1.0))
+    blend = blend * blend * (3.0 - 2.0 * blend)
+    blended_target = (1.0 - blend) * target + blend * outgoing_target
+    blended_yaw = wrap_angle((1.0 - blend) * desired_yaw + blend * outgoing_yaw)
+    return blended_target, blended_yaw
+
+
 def guidance_to_dual_thruster_command(
     ekf_state: EKFState,
     target_position: np.ndarray,
     desired_yaw: Optional[float] = None,
     gains: Optional[GuidanceGains] = None,
+    relative_target_position: Optional[np.ndarray] = None,
 ) -> ControlCommand:
     """
     Gera comando fisicamente consistente para o arranjo dual-thruster.
@@ -199,12 +281,15 @@ def guidance_to_dual_thruster_command(
     """
     g = gains or GuidanceGains()
 
-    pos = np.asarray(ekf_state.position, dtype=float)
     vel = np.asarray(ekf_state.velocity_linear, dtype=float)
     ang = np.asarray(ekf_state.velocity_angular, dtype=float)
     yaw = float(ekf_state.orientation[2])
 
-    delta_world = np.asarray(target_position, dtype=float) - pos
+    if relative_target_position is not None:
+        delta_world = np.asarray(relative_target_position, dtype=float)
+    else:
+        pos = np.asarray(ekf_state.position, dtype=float)
+        delta_world = np.asarray(target_position, dtype=float) - pos
     err_body = body_frame_position_error(delta_world, yaw)
     forward_err, lateral_err, depth_err = err_body
 
@@ -212,6 +297,7 @@ def guidance_to_dual_thruster_command(
     if desired_yaw is None:
         desired_yaw = float(np.arctan2(delta_world[1], delta_world[0])) if horizontal_dist > 1e-6 else yaw
     yaw_err = wrap_angle(float(desired_yaw) - yaw)
+    abs_yaw_err = abs(yaw_err)
 
     surge = float(vel[0])
     heave = float(vel[2])
@@ -236,17 +322,63 @@ def guidance_to_dual_thruster_command(
         theta = float(np.clip(np.arctan2(yz_mag, x_mag), 0.0, np.radians(g.max_theta_deg)))
         phi = float(np.arctan2(cmd_z, cmd_y)) if yz_mag > 1e-6 else 0.0
 
-        distance_scale = float(np.tanh(np.linalg.norm(err_body) / 3.0))
-        desired_surge = np.sign(forward_err if abs(forward_err) > 0.15 else cmd_x) * g.k_forward * distance_scale
-        if horizontal_dist < 1.5:
-            desired_surge *= 0.35 + 0.65 * horizontal_dist / 1.5
+        horizontal_scale = float(np.clip(3.2 / max(horizontal_dist, 1e-6), 0.35, 1.0))
+        distance_scale = float(np.tanh(np.linalg.norm(err_body) / 4.8)) * horizontal_scale
+        approach = float(np.tanh(forward_err / 0.9))
+        desired_surge = g.k_forward * approach * distance_scale
+        if horizontal_dist > 4.0:
+            desired_surge *= 0.70
+        if horizontal_dist < 2.0:
+            desired_surge *= float(np.clip(horizontal_dist / 2.0, 0.0, 1.0))
+        if abs(forward_err) < 1.0:
+            desired_surge *= 0.25
+        if horizontal_dist < 3.0:
+            desired_surge *= float(np.clip(horizontal_dist / 3.0, 0.0, 1.0))
+        if forward_err < -0.25:
+            reverse_bias = float(np.tanh((-forward_err - 0.25) / 0.7))
+            desired_surge = min(desired_surge, -1.15 * g.k_forward * reverse_bias)
+        if horizontal_dist < 1.8 and abs(forward_err) < 1.3:
+            desired_surge -= 2.4 * g.k_surge_brake * np.tanh(surge / 0.22)
         base_power = float(np.clip(
-            desired_surge - g.k_surge_damp * surge,
-            -g.max_reverse_power,
-            g.max_forward_power,
+            desired_surge - g.k_surge_damp * surge - 1.2 * g.k_surge_brake * np.tanh(surge / 0.5),
+            -0.22,
+            0.32,
         ))
+        if forward_err > 0.8 and horizontal_dist > 1.25:
+            base_power = max(base_power, 0.35 * float(np.clip(horizontal_dist / 5.0, 0.50, 1.0)))
 
-    yaw_cmd = float(np.clip(-0.08 * yaw_rate, -g.max_yaw_diff, g.max_yaw_diff))
+        # Turn-first behavior: when heading is still far from the target line,
+        # bleed forward thrust so the vehicle does not fly a wide arc past the waypoint.
+        align_lo = np.radians(g.align_yaw_threshold_deg)
+        align_hi = np.radians(g.hard_turn_yaw_threshold_deg)
+        turn_factor = float(np.clip((abs_yaw_err - align_lo) / max(1e-6, align_hi - align_lo), 0.0, 1.0))
+        if turn_factor > 0.0:
+            forward_scale = g.turn_forward_floor + (1.0 - g.turn_forward_floor) * (1.0 - turn_factor) ** g.turn_forward_exp
+            base_power *= forward_scale
+            base_power -= g.turn_brake_gain * turn_factor * np.tanh(surge / 0.35)
+
+        lateral_ratio = abs(lateral_err) / (abs(forward_err) + abs(lateral_err) + 1e-6)
+        if horizontal_dist > 1.0 and lateral_ratio > 0.55:
+            lateral_turn_factor = float(np.clip((lateral_ratio - 0.55) / 0.45, 0.0, 1.0))
+            base_power *= (1.0 - 0.55 * lateral_turn_factor)
+            base_power -= 0.10 * lateral_turn_factor * np.tanh(surge / 0.30)
+
+        # Path following: bleed more speed as curvature demand grows.
+        curvature_turn_scale = (
+            g.path_turn_speed_floor
+            + (1.0 - g.path_turn_speed_floor)
+            * (1.0 - float(np.clip(abs_yaw_err / np.pi, 0.0, 1.0))) ** g.path_turn_speed_exp
+        )
+        base_power *= curvature_turn_scale
+
+    heading_cmd = float(np.arctan2(lateral_err, max(0.05, forward_err)))
+    yaw_cmd = float(np.clip(
+        0.72 * np.tanh(heading_cmd)
+        + 0.34 * np.tanh(yaw_err)
+        - 0.16 * yaw_rate,
+        -g.max_yaw_diff,
+        g.max_yaw_diff,
+    ))
 
     p1 = float(np.clip(base_power - yaw_cmd, -1.0, 1.0))
     p2 = float(np.clip(base_power + yaw_cmd, -1.0, 1.0))
@@ -476,13 +608,16 @@ class LQRController:
         hover_depth: float = 2.0,
         adaptive_relinearization: bool = True,
         relinearization_interval_s: float = 1.0,
+        guidance_tuning: Optional[dict] = None,
     ):
         self.physics     = physics_engine
+        self._control_engine = None  # set by ControlEngine after instantiation for waypoint detection
         self.weights     = weights or LQRWeights()
         self.hover_depth = hover_depth
         self.adaptive_relinearization = adaptive_relinearization
         self.relinearization_interval_s = float(max(0.2, relinearization_interval_s))
         self._last_relinearization_time = -np.inf
+        self._guidance_tuning = guidance_tuning or {}
 
         # lineariza o sistema uma vez
         self.linearizer = SystemLinearizer(physics_engine)
@@ -576,21 +711,23 @@ class LQRController:
             ekf_state=ekf_state,
             target_position=self._x_ref[:3],
             desired_yaw=float(self._x_ref[5]),
+            relative_target_position=(None if getattr(ekf_state, "vision_relative_waypoint", None) is None else np.asarray(ekf_state.vision_relative_waypoint, dtype=float)),
             gains=GuidanceGains(
-                k_forward=0.54,
-                k_surge_damp=0.44,
-                k_yaw=1.05,
-                k_lateral=0.18,
-                k_yaw_damp=0.60,
-                k_depth=0.12,
-                k_heave_damp=0.16,
-                k_ballast=0.22,
-                k_ballast_damp=0.12,
-                max_forward_power=0.58,
-                max_reverse_power=0.34,
-                max_yaw_diff=0.22,
-                max_theta_deg=14.0,
-                depth_deadband_m=0.18,
+                k_forward=0.48 * float(self._guidance_tuning.get('k_forward_mult', 1.0)),
+                k_surge_damp=0.30 * float(self._guidance_tuning.get('k_surge_damp_mult', 1.0)),
+                k_surge_brake=0.34 * float(self._guidance_tuning.get('k_surge_brake_mult', 1.0)),
+                k_yaw=1.05 * float(self._guidance_tuning.get('k_yaw_mult', 1.0)),
+                k_lateral=0.18 * float(self._guidance_tuning.get('k_lateral_mult', 1.0)),
+                k_yaw_damp=0.60 * float(self._guidance_tuning.get('k_yaw_damp_mult', 1.0)),
+                k_depth=0.12 * float(self._guidance_tuning.get('k_depth_mult', 1.0)),
+                k_heave_damp=0.16 * float(self._guidance_tuning.get('k_heave_damp_mult', 1.0)),
+                k_ballast=0.22 * float(self._guidance_tuning.get('k_ballast_mult', 1.0)),
+                k_ballast_damp=0.12 * float(self._guidance_tuning.get('k_ballast_damp_mult', 1.0)),
+                max_forward_power=0.42 * float(self._guidance_tuning.get('max_forward_power_mult', 1.0)),
+                max_reverse_power=0.34 * float(self._guidance_tuning.get('max_reverse_power_mult', 1.0)),
+                max_yaw_diff=0.22 * float(self._guidance_tuning.get('max_yaw_diff_mult', 1.0)),
+                max_theta_deg=14.0 * float(self._guidance_tuning.get('max_theta_deg_mult', 1.0)),
+                depth_deadband_m=0.18 * float(self._guidance_tuning.get('depth_deadband_mult', 1.0)),
             ),
         )
         u = np.array([
@@ -786,7 +923,12 @@ class ControlEngine:
         self.hover_depth = hover_depth
 
         # inicializa LQR como controlador padrão
-        self._lqr = LQRController(physics_engine, hover_depth=hover_depth)
+        self._lqr = LQRController(
+            physics_engine,
+            hover_depth=hover_depth,
+            guidance_tuning=globals().get('LQR_GUIDANCE_TUNING', {}),
+        )
+        self._lqr._control_engine = self  # enable waypoint detection in LQR
         self._mpc = None   # implementado no próximo módulo
         self._rl  = None   # implementado no próximo módulo
 
@@ -794,6 +936,7 @@ class ControlEngine:
         self._reference = np.array([0.0, 0.0, hover_depth])
         self._waypoints: list[np.ndarray] = []
         self._waypoint_threshold = 0.5
+        self._waypoint_transition_radius = 2.0
         self._current_waypoint_idx = 0
 
     def _active_controller(self):
@@ -811,6 +954,47 @@ class ControlEngine:
         if self._current_waypoint_idx < len(self._waypoints):
             return self._waypoints[self._current_waypoint_idx]
         return self._waypoints[-1]
+
+    def _navigation_position(self) -> np.ndarray:
+        """
+        Position used for waypoint-arrival bookkeeping.
+
+        In the simulator we have access to the physics truth, which avoids
+        false waypoint transitions caused by horizontal EKF drift when there
+        is no absolute x/y fix available.
+        """
+        state = getattr(self.physics, "state", None)
+        if state is not None:
+            return np.array([state.x, state.y, state.z], dtype=float)
+        return np.asarray(self._reference, dtype=float)
+
+    def _guidance_target_and_yaw(self, position_for_guidance: np.ndarray) -> tuple[Optional[np.ndarray], float]:
+        target = self._current_target()
+        if target is None:
+            return None, 0.0
+
+        desired_yaw = 0.0
+        if self._waypoints and self._current_waypoint_idx < len(self._waypoints):
+            current = np.asarray(self._waypoints[self._current_waypoint_idx], dtype=float)
+            prev_wp = None
+            if self._current_waypoint_idx > 0:
+                prev_wp = np.asarray(self._waypoints[self._current_waypoint_idx - 1], dtype=float)
+            next_wp = None
+            if self._current_waypoint_idx < len(self._waypoints) - 1:
+                next_wp = np.asarray(self._waypoints[self._current_waypoint_idx + 1], dtype=float)
+            target, desired_yaw = path_guidance_target(
+                position=np.asarray(position_for_guidance, dtype=float),
+                previous_waypoint=prev_wp,
+                current_waypoint=current,
+                next_waypoint=next_wp,
+                desired_depth=float(current[2]),
+            )
+        else:
+            delta = np.asarray(target, dtype=float) - np.asarray(position_for_guidance, dtype=float)
+            if np.linalg.norm(delta[:2]) > 1e-6:
+                desired_yaw = float(np.arctan2(delta[1], delta[0]))
+
+        return np.asarray(target, dtype=float), desired_yaw
 
     def _sync_reference(self) -> None:
         target = self._current_target()
@@ -864,7 +1048,7 @@ class ControlEngine:
         self._waypoint_threshold = float(waypoint_threshold)
         self._sync_reference()
         if self._rl is not None and hasattr(self._rl, 'set_waypoints'):
-            self._rl.set_waypoints([wp.copy() for wp in self._waypoints])
+            self._rl.set_waypoints([wp.copy() for wp in self._waypoints], waypoint_threshold=self._waypoint_threshold)
 
     def clear_waypoints(self) -> None:
         """Remove a sequência de waypoints e volta para a referência atual."""
@@ -895,21 +1079,71 @@ class ControlEngine:
             return False
 
         target = self._waypoints[self._current_waypoint_idx]
-        dist = float(np.linalg.norm(np.asarray(position, dtype=float) - target))
-        if dist <= self._waypoint_threshold:
+        pos = np.asarray(position, dtype=float)
+        delta = pos - target
+        is_final_waypoint = self._current_waypoint_idx >= (len(self._waypoints) - 1)
+        if is_final_waypoint:
+            reached = float(np.linalg.norm(delta)) <= self._waypoint_threshold
+        else:
+            horizontal_dist = float(np.linalg.norm(delta[:2]))
+            depth_dist = abs(float(delta[2]))
+            reached = (
+                horizontal_dist <= (1.5 * self._waypoint_threshold)
+                and depth_dist <= max(0.8, 1.5 * self._waypoint_threshold)
+            )
+
+        # Additional pass-by detection: if the vehicle has moved beyond the current
+        # waypoint along the segment from the previous waypoint and is within a
+        # lateral tolerance, consider it reached to avoid skipping without triggering
+        # the exact threshold (useful when controllers pass by the point).
+        if not reached and self._current_waypoint_idx > 0:
+            prev_wp = self._waypoints[self._current_waypoint_idx - 1]
+            seg = target[:2] - prev_wp[:2]
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len > 1e-6:
+                seg_hat = seg / seg_len
+                rel = pos[:2] - prev_wp[:2]
+                t = float(np.dot(rel, seg_hat))
+                # lateral distance to segment
+                proj = prev_wp[:2] + np.clip(t, 0.0, seg_len) * seg_hat
+                lateral = float(np.linalg.norm(pos[:2] - proj))
+                # if passed beyond the end (t > seg_len) but lateral distance small,
+                # treat as reached
+                if t >= seg_len and lateral <= max(1.5 * self._waypoint_threshold, 1.0):
+                    reached = True
+
+        if reached:
             self._current_waypoint_idx += 1
             self._sync_reference()
             return True
         return False
 
+    def is_near_waypoint(self, position: np.ndarray, capture_radius_m: float = 0.5) -> bool:
+        """
+        Detects terminal capture mode: when vehicle is within capture_radius of current waypoint.
+        Used by controllers (especially MPC) to apply stronger terminal braking/control.
+        
+        Args:
+            position: Current position [x, y, z]
+            capture_radius_m: Horizontal radius defining "near waypoint" zone (default 0.5m)
+        
+        Returns:
+            True if within capture radius of current waypoint
+        """
+        if not self._waypoints or self._current_waypoint_idx >= len(self._waypoints):
+            return False
+        
+        target = self._waypoints[self._current_waypoint_idx]
+        pos = np.asarray(position, dtype=float)
+        horizontal_dist = float(np.linalg.norm(pos[:2] - target[:2]))
+        return horizontal_dist <= capture_radius_m
+
     def compute(self, ekf_state: EKFState, time: float) -> ControlCommand:
         """Calcula comando usando o controlador ativo."""
         if self._active in ('lqr', 'mpc'):
-            self.check_waypoint_reached(ekf_state.position)
-            target = self._current_target()
+            self.check_waypoint_reached(self._navigation_position())
+            target, yaw = self._guidance_target_and_yaw(ekf_state.position)
             if target is not None:
-                delta = np.asarray(target, dtype=float) - np.asarray(ekf_state.position, dtype=float)
-                yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-6 else 0.0
                 if self._active == 'lqr':
                     self._lqr.set_reference(target, yaw)
                     if self._lqr._last_time is None and self._waypoints:
@@ -960,7 +1194,7 @@ if __name__ == "__main__":
     physics = PhysicsEngine(geo, max_thruster_force=10.0)
     env     = Environment(pool_depth=5.0)
     sensors = SensorEngine(env, noise_scale=1.0)
-    ekf     = ExtendedKalmanFilter(physics)
+    ekf     = ExtendedKalmanFilter(physics, pool_radius=getattr(env, 'pool_radius', 50.0), pool_depth=getattr(env, 'pool_depth', 5.0))
     control = ControlEngine(physics, hover_depth=2.0)
 
     # Teste 1 — verifica matrizes A e B
