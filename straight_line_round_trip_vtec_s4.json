@@ -1,0 +1,59 @@
+{
+  "waypoints": [
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0]
+  ],
+  "static_obstacles": [],
+  "dynamic_obstacles": [],
+  "dt": 0.01,
+  "max_steps": 12000,
+  "trials": 1,
+  "pool_depth": 10.0,
+  "pool_radius": 30.0,
+  "pool_shape": "rectangle",
+  "pool_length": 30.0,
+  "pool_width": 1.0,
+  "noise_scale": 0.05,
+  "rayleigh_enabled": true,
+  "rayleigh_sigma": 0.01,
+  "env_disturbance_scale": 0.05,
+  "env_spectral_enabled": false,
+  "wave_hs": 0.0,
+  "seed": 42,
+  "benchmark_mode": "mission",
+  "hold_position": [0.0, 0.0, 0.0],
+  "surface_depth": 0.0,
+  "planar_dof": true,
+  "lqr_tuning": {
+    "lqr_q_z_mult": 2.7019364744483814,
+    "lqr_q_att_mult": 0.490038718801601,
+    "lqr_q_vel_mult": 1.042579159596622,
+    "lqr_r_power_mult": 0.8249900668167036
+  },
+  "lqr_guidance_tuning": {
+    "k_yaw_mult": 2.5116453070782505,
+    "k_lateral_mult": 1.7065586484309154,
+    "k_yaw_damp_mult": 2.3135373625144635,
+    "max_yaw_diff_mult": 2.96281542925752,
+    "max_forward_power_mult": 0.4470201264959605,
+    "k_forward_mult": 0.32404334347194264
+  },
+    "mpc_tuning": {
+    "max_cruise_mult": 0.32,
+    "desired_surge_mult": 0.82,
+    "base_power_gain_mult": 0.42,
+    "lateral_yaw_mult": 0.95,
+    "yaw_error_mult": 0.12,
+    "yaw_damp_mult": 1.05,
+    "lateral_speed_penalty_mult": 1.75,
+    "reverse_penalty": 0.10,
+    "terminal_pull_mult": 1.25,
+    "boundary_margin_m": 0.20
+  },
+  "obstacle_collision_threshold_m": 0.2,
+  "boundary_collision_threshold_m": -0.02,
+  "position_tolerance_m": 0.5,
+  "attitude_tolerance_deg": 12.0,
+  "use_truth_position_for_guidance": true
+}
+

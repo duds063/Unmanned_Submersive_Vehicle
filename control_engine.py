@@ -172,6 +172,8 @@ class GuidanceGains:
     turn_brake_gain: float = 0.18
     align_yaw_threshold_deg: float = 55.0
     hard_turn_yaw_threshold_deg: float = 100.0
+    uturn_blend_yaw_threshold_deg: float = 120.0
+    uturn_blend_start_m: float = 1.5
 
 
 def wrap_angle(angle: float) -> float:
@@ -251,6 +253,15 @@ def path_guidance_target(
 
     seg_hat = seg / seg_len
     outgoing_yaw = float(np.arctan2(seg_hat[1], seg_hat[0]))
+
+    # For near 180° reversals (U-turns), avoid early blending into the next
+    # segment; otherwise the vehicle starts turning too soon in tight lanes.
+    yaw_change = abs(wrap_angle(outgoing_yaw - desired_yaw))
+    if yaw_change >= np.radians(float(g.uturn_blend_yaw_threshold_deg)):
+        lane_capture_radius = min(0.45, 0.2 * float(g.path_lookahead_m))
+        if dist_to_current > min(float(g.uturn_blend_start_m), lane_capture_radius):
+            return target, desired_yaw
+
     outgoing_lookahead = min(float(g.path_lookahead_m), seg_len)
     outgoing_target = np.array([
         current[0] + outgoing_lookahead * seg_hat[0],
@@ -938,6 +949,35 @@ class ControlEngine:
         self._waypoint_threshold = 0.5
         self._waypoint_transition_radius = 2.0
         self._current_waypoint_idx = 0
+
+        # Pool bounds are provided by benchmark/mission orchestration.
+        self._pool_shape = 'circular'
+        self._pool_radius = 30.0
+        self._pool_length = 60.0
+        self._pool_width = 60.0
+
+    def set_pool_bounds(
+        self,
+        *,
+        pool_shape: str,
+        pool_radius: float,
+        pool_length: Optional[float] = None,
+        pool_width: Optional[float] = None,
+    ) -> None:
+        self._pool_shape = str(pool_shape or 'circular').lower()
+        self._pool_radius = float(pool_radius)
+        self._pool_length = float(pool_length) if pool_length is not None else (2.0 * self._pool_radius)
+        self._pool_width = float(pool_width) if pool_width is not None else (2.0 * self._pool_radius)
+
+    def horizontal_clearance(self, position: np.ndarray) -> float:
+        pos = np.asarray(position, dtype=float)
+        if self._pool_shape == 'rectangle':
+            half_length = 0.5 * float(self._pool_length)
+            half_width = 0.5 * float(self._pool_width)
+            clearance_x = half_length - abs(float(pos[0]))
+            clearance_y = half_width - abs(float(pos[1]))
+            return float(min(clearance_x, clearance_y))
+        return float(self._pool_radius - float(np.linalg.norm(pos[:2])))
 
     def _active_controller(self):
         if self._active == 'lqr':

@@ -33,9 +33,9 @@ try:
 except Exception:  # pragma: no cover - plotting is optional at runtime
     plt = None
 
-from geometry_engine import GeometryEngine
 from physics_engine import PhysicsEngine, VehicleState
 from rl_controller import ActorCritic, PPOUpdater, RolloutBuffer
+from vehicle_profiles import load_taluy_profile
 
 
 def _wrap_angle(angle: float) -> float:
@@ -76,25 +76,27 @@ class BarrelRollConfig:
     initial_attitude_jitter: float = 0.04
 
     target_turns: float = 1.0
-    curriculum_stages: Tuple[float, float, float] = (0.25, 0.5, 1.0)
-    curriculum_breakpoints: Tuple[float, float] = (0.30, 0.70)
+    curriculum_stages: Tuple[float, float, float] = (0.25, 0.75, 1.5)
+    curriculum_breakpoints: Tuple[float, float] = (0.35, 0.70)
 
     max_thruster_force: float = 12.0
     max_tilt_deg: float = 60.0
     hover_depth_safety: float = 0.75
     pitch_safety_deg: float = 100.0
+    vehicle_profile_source: str = "asset_zoo/vehicles/taluy/taluy_mjcf.xml"
     env_force_gain: float = 1.0
     env_turbulence_gain: float = 1.0
     env_wave_freq: float = 0.8
     enable_domain_randomization: bool = False
 
-    roll_progress_weight: float = 4.0
-    roll_track_weight: float = 2.5
-    depth_weight: float = 1.5
-    speed_weight: float = 0.8
-    attitude_penalty: float = 0.15
-    stability_penalty: float = 0.05
-    action_penalty: float = 0.01
+    roll_progress_weight: float = 50.0
+    roll_track_weight: float = 10.0
+    roll_velocity_weight: float = 5.0
+    depth_weight: float = 0.2
+    speed_weight: float = 0.1
+    attitude_penalty: float = 0.01
+    stability_penalty: float = 0.005
+    action_penalty: float = 0.002
     completion_bonus: float = 20.0
 
     gamma: float = 0.99
@@ -119,6 +121,7 @@ class EpisodeSummary:
     final_depth_error: float
     final_pitch_deg: float
     update_metrics: Dict[str, float] = field(default_factory=dict)
+    reward_components: Dict[str, float] = field(default_factory=dict)
 
 
 class BarrelRollEnvironment:
@@ -130,10 +133,15 @@ class BarrelRollEnvironment:
         self.rng = np.random.default_rng(config.seed)
 
         if physics is None:
-            geometry = GeometryEngine(L=0.8, D=0.1)
-            self.physics = PhysicsEngine(geometry, max_thruster_force=config.max_thruster_force)
+            profile = load_taluy_profile(config.vehicle_profile_source)
+            self.profile = profile
+            self.physics = PhysicsEngine.from_vehicle_profile(
+                profile,
+                max_thruster_force=config.max_thruster_force,
+            )
         else:
             self.physics = physics
+            self.profile = None
 
         self.target_roll = 2.0 * np.pi * float(config.target_turns)
         self.current_target_roll = self.target_roll
@@ -253,19 +261,35 @@ class BarrelRollEnvironment:
         depth_reward = math.exp(-((depth_error / max(self.config.hover_depth_safety, 1e-6)) ** 2))
         speed_reward = math.exp(-((speed_error / max(0.25, self.config.target_speed)) ** 2))
 
+        # compute component-level values for logging and diagnostic
         roll_progress_reward = roll_delta / max(1e-6, self.current_target_roll)
+        roll_velocity_error = abs(state.p - (self.current_target_roll / max(self.config.episode_steps * self.config.dt, 1e-6)))
+        roll_velocity_reward = math.exp(-roll_velocity_error / max(0.5, 1.0))
+
         attitude_penalty = (state.tht ** 2 + 0.5 * state.psi ** 2)
-        stability_penalty = 0.25 * state.q ** 2 + 0.25 * state.r ** 2 + 0.10 * state.v ** 2 + 0.10 * state.w ** 2
+        stability_penalty = 0.10 * state.q ** 2 + 0.10 * state.r ** 2 + 0.05 * state.v ** 2 + 0.05 * state.w ** 2
         action_penalty = float(np.sum(np.square(np.clip(action, -1.0, 1.0))))
 
+        # components
+        roll_progress_component = float(self.config.roll_progress_weight * roll_progress_reward)
+        roll_track_component = float(self.config.roll_track_weight * target_tracking)
+        roll_velocity_component = float(getattr(self.config, 'roll_velocity_weight', 3.0) * roll_velocity_reward)
+        depth_component = float(self.config.depth_weight * depth_reward)
+        speed_component = float(self.config.speed_weight * speed_reward)
+        attitude_component = float(-self.config.attitude_penalty * attitude_penalty)
+        stability_component = float(-self.config.stability_penalty * stability_penalty)
+        action_component = float(-self.config.action_penalty * action_penalty)
+
+        # base reward is sum of components; completion bonus and episodic penalty applied below
         reward = (
-            self.config.roll_progress_weight * roll_progress_reward
-            + self.config.roll_track_weight * target_tracking
-            + self.config.depth_weight * depth_reward
-            + self.config.speed_weight * speed_reward
-            - self.config.attitude_penalty * attitude_penalty
-            - self.config.stability_penalty * stability_penalty
-            - self.config.action_penalty * action_penalty
+            roll_progress_component
+            + roll_track_component
+            + roll_velocity_component
+            + depth_component
+            + speed_component
+            + attitude_component
+            + stability_component
+            + action_component
         )
 
         success = False
@@ -274,6 +298,15 @@ class BarrelRollEnvironment:
                 reward += self.config.completion_bonus
                 self.completion_awarded = True
                 success = True
+
+        # EPISODIC PENALTY: applied only on final step of episode
+        episodic_penalty = 0.0
+        if (step_index + 1) == self.config.episode_steps:
+            required_min_roll = self.current_target_roll * 0.3  # Must roll at least 30% of target
+            if self.roll_progress < required_min_roll:
+                insufficient_roll = required_min_roll - self.roll_progress
+                episodic_penalty = float(insufficient_roll * 5.0)  # Gentle linear penalty
+                reward = reward - episodic_penalty
 
         pitch_limit = np.radians(self.config.pitch_safety_deg)
         done = False
@@ -292,6 +325,19 @@ class BarrelRollEnvironment:
             "depth_error": float(depth_error),
             "speed_error": float(speed_error),
             "success": float(success),
+        }
+
+        info["reward_components"] = {
+            "roll_progress": roll_progress_component,
+            "roll_track": roll_track_component,
+            "roll_velocity": roll_velocity_component,
+            "depth": depth_component,
+            "speed": speed_component,
+            "attitude": attitude_component,
+            "stability": stability_component,
+            "action": action_component,
+            "episodic_penalty": episodic_penalty,
+            "total": float(reward),
         }
 
         return self._observation(), float(reward), done, info
@@ -354,6 +400,8 @@ class BarrelRollTrainer:
             "depth_error": 0.0,
             "success": 0.0,
         }
+        # accumulator for per-step reward components
+        comp_acc: Dict[str, float] = {}
 
         for step_index in range(self.config.episode_steps):
             if training:
@@ -368,6 +416,11 @@ class BarrelRollTrainer:
                 buffer.add(obs, action, log_prob, reward, value, done)
             obs = next_obs
             episode_reward += reward
+            # accumulate reward components if provided by env
+            comps = info.get("reward_components") if isinstance(info, dict) else None
+            if isinstance(comps, dict):
+                for k, v in comps.items():
+                    comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
             success = bool(info.get("success", 0.0)) or success
 
             if done:
@@ -390,6 +443,7 @@ class BarrelRollTrainer:
             final_depth_error=float(info.get("depth_error", 0.0)),
             final_pitch_deg=float(np.degrees(self.env.physics.state.tht)),
             update_metrics=update_metrics,
+            reward_components=comp_acc,
         )
         return summary
 
@@ -460,6 +514,27 @@ class BarrelRollTrainer:
             "entropy": entropies,
             "evaluation": evaluation,
         }
+
+        # extract per-episode reward components if available
+        comp_keys = [
+            "roll_progress",
+            "roll_track",
+            "roll_velocity",
+            "depth",
+            "speed",
+            "attitude",
+            "stability",
+            "action",
+            "episodic_penalty",
+            "total",
+        ]
+        comps: Dict[str, List[float]] = {k: [] for k in comp_keys}
+        for item in episode_history:
+            rc = item.get("reward_components") or {}
+            for k in comp_keys:
+                comps[k].append(float(rc.get(k, 0.0)))
+
+        curve_data["reward_components"] = comps
 
         self.curve_report_path.write_text(json.dumps(_to_jsonable(curve_data), indent=2), encoding="utf-8")
 
@@ -618,6 +693,7 @@ def run_phase(
         episode_reward = 0.0
         last_info: Dict[str, float] = {"roll_turns": 0.0, "depth_error": 0.0, "success": 0.0}
         success = False
+        comp_acc: Dict[str, float] = {}
 
         for step in range(config.episode_steps):
             action, log_prob, value = hrl.network.act(obs, update_obs_stats=True)
@@ -627,6 +703,11 @@ def run_phase(
             obs = next_obs
             episode_reward += float(reward)
             last_info = info
+            # accumulate reward components if present
+            comps = info.get("reward_components") if isinstance(info, dict) else None
+            if isinstance(comps, dict):
+                for k, v in comps.items():
+                    comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
             success = success or bool(info.get("success", 0.0))
 
             total_steps += 1
@@ -657,6 +738,7 @@ def run_phase(
                 "final_depth_error": float(last_info.get("depth_error", 0.0)),
                 "final_pitch_deg": float(np.degrees(hrl.env.physics.state.tht)),
                 "update_metrics": maybe_metrics or {},
+                "reward_components": comp_acc,
             }
         )
 

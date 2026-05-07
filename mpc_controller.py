@@ -138,6 +138,13 @@ class MPCController:
         self.tune_max_cruise_mult = float(tuning.get('max_cruise_mult', 1.0))
         self.tune_desired_surge_mult = float(tuning.get('desired_surge_mult', 1.0))
         self.tune_base_power_gain_mult = float(tuning.get('base_power_gain_mult', 1.0))
+        self.tune_lateral_yaw_mult = float(tuning.get('lateral_yaw_mult', 1.0))
+        self.tune_yaw_error_mult = float(tuning.get('yaw_error_mult', 1.0))
+        self.tune_yaw_damp_mult = float(tuning.get('yaw_damp_mult', 1.0))
+        self.tune_lateral_speed_penalty_mult = float(tuning.get('lateral_speed_penalty_mult', 1.0))
+        self.tune_reverse_penalty = float(tuning.get('reverse_penalty', 0.55))
+        self.tune_terminal_pull_mult = float(tuning.get('terminal_pull_mult', 1.0))
+        self.tune_boundary_margin_m = float(tuning.get('boundary_margin_m', 0.25))
 
         # dimensões
         self.nx = 12   # estados
@@ -167,6 +174,9 @@ class MPCController:
         self._last_u_prev = np.zeros(self.nu)
         self._solve_time  = 0.0
         self._solve_status = 'not_solved'
+        self._post_turn_recovery_steps = 0
+        self._was_concentric_turn = False
+        self._reverse_hold_steps = 0
 
     # ─── Interface pública ───────────────────
 
@@ -228,6 +238,14 @@ class MPCController:
         yaw_err = wrap_angle(desired_yaw - yaw)
         abs_yaw_err = abs(yaw_err)
 
+        boundary_clearance = float('inf')
+        if self.control_engine is not None and hasattr(self.control_engine, 'horizontal_clearance'):
+            try:
+                boundary_clearance = float(self.control_engine.horizontal_clearance(pos))
+            except Exception:
+                boundary_clearance = float('inf')
+        boundary_margin = float(max(0.05, getattr(self, 'tune_boundary_margin_m', 0.25)))
+
         # Check if in terminal capture mode (near waypoint)
         in_terminal_capture = (
             self.control_engine is not None and 
@@ -247,33 +265,102 @@ class MPCController:
         if abs_yaw_err > np.radians(85.0):
             desired_surge *= 0.05
 
+        # Back-and-fill decision: compare forward vs reverse maneuver costs.
+        # Reverse is allowed but penalized, so it is chosen only when safety/radius needs it.
+        reverse_mode = False
+        if self._reverse_hold_steps > 0:
+            reverse_mode = True
+            self._reverse_hold_steps -= 1
+        else:
+            near_boundary = boundary_clearance < (boundary_margin + 0.35)
+            tight_turn = abs_yaw_err > np.radians(35.0)
+            need_backfill = tight_turn and (near_boundary or abs(lateral_err) > 1.2)
+            if need_backfill:
+                fwd_risk = max(0.0, (boundary_margin + 0.35) - boundary_clearance)
+                cost_forward = 2.2 * abs_yaw_err + 3.0 * fwd_risk + 1.2 * max(0.0, surge)
+                cost_reverse = (
+                    float(getattr(self, 'tune_reverse_penalty', 0.55))
+                    + 0.9 * abs_yaw_err
+                    + 0.6 * fwd_risk
+                    + max(0.0, -surge)
+                )
+                if cost_reverse + 0.05 < cost_forward:
+                    reverse_mode = True
+                    self._reverse_hold_steps = 10
+
+        if reverse_mode:
+            reverse_target = 0.12 + 0.22 * float(np.clip(abs_yaw_err / np.pi, 0.0, 1.0))
+            desired_surge = min(desired_surge, -float(np.clip(reverse_target, 0.08, 0.35)))
+
         # Terminal capture mode: apply strong braking when near waypoint to prevent circling
         if in_terminal_capture:
             # Near the waypoint — reduce speed dramatically and increase depth control
             desired_surge *= 0.15  # heavy braking near waypoint
             depth_err *= 2.5       # amplify depth correction to settle at target z quickly
 
+        # Terminal pull: once aligned and close enough, force exit from reverse behavior.
+        if horiz_dist < 1.0 and abs_yaw_err < np.radians(20.0):
+            self._reverse_hold_steps = 0
+            desired_surge = max(desired_surge, 0.08 * float(getattr(self, 'tune_terminal_pull_mult', 1.0)))
+
         # If the target is behind the body axis, allow gentle reverse/braking.
         if forward_err < -0.35:
             desired_surge = min(desired_surge, -0.20 * float(np.tanh((-forward_err - 0.35) / 0.7)))
+
+        # Hard safety constraint near boundary: prohibit positive surge when margin is violated.
+        if boundary_clearance < boundary_margin:
+            desired_surge = min(desired_surge, -0.10)
 
         base_power = 0.9 * float(getattr(self, 'tune_base_power_gain_mult', 1.0)) * (desired_surge - surge) - 0.10 * np.tanh(surge / 0.45)
         if abs_yaw_err > np.radians(45.0):
             base_power -= 0.12 * float(np.tanh(surge / 0.35))
         if abs(lateral_err) > 1.0:
             lateral_scale = float(np.clip(abs(lateral_err) / 3.0, 0.0, 1.0))
-            base_power *= (1.0 - 0.35 * lateral_scale)
+            base_power *= (1.0 - 0.35 * float(getattr(self, 'tune_lateral_speed_penalty_mult', 1.0)) * lateral_scale)
         base_power = float(np.clip(base_power, -0.28, 0.24))
+        if boundary_clearance < boundary_margin:
+            base_power = min(base_power, 0.0)
 
         yaw_cmd = (
-            0.30 * float(np.tanh(lateral_err / 1.2))
-            + 1.05 * float(np.tanh(yaw_err / 0.9))
-            - 0.22 * yaw_rate
+            0.30 * float(getattr(self, 'tune_lateral_yaw_mult', 1.0)) * float(np.tanh(lateral_err / 1.2))
+            + 1.05 * float(getattr(self, 'tune_yaw_error_mult', 1.0)) * float(np.tanh(yaw_err / 0.9))
+            - 0.22 * float(getattr(self, 'tune_yaw_damp_mult', 1.0)) * yaw_rate
         )
         yaw_cmd = float(np.clip(yaw_cmd, -0.34, 0.34))
+        brake_threshold = np.radians(5.0)
 
-        p1 = float(np.clip(base_power - yaw_cmd, -1.0, 1.0))
-        p2 = float(np.clip(base_power + yaw_cmd, -1.0, 1.0))
+        post_turn_recovery = self._post_turn_recovery_steps > 0
+        if self._was_concentric_turn and abs_yaw_err < brake_threshold:
+            self._post_turn_recovery_steps = max(self._post_turn_recovery_steps, 8)
+            post_turn_recovery = True
+
+        # When the heading error is large, pivot using opposite thruster
+        # directions so the boat brakes first, then executes a concentric turn.
+        turn_threshold = np.radians(45.0)
+        concentric_turn = abs_yaw_err >= turn_threshold or in_terminal_capture
+        brake_first = concentric_turn and abs(surge) > 0.08 and abs_yaw_err < np.radians(6.0)
+        if post_turn_recovery:
+            recovery_power = 0.03 if abs(surge) < 0.25 else 0.02
+            p1 = float(np.clip(recovery_power, -1.0, 1.0))
+            p2 = float(np.clip(recovery_power, -1.0, 1.0))
+            self._post_turn_recovery_steps = max(0, self._post_turn_recovery_steps - 1)
+        elif brake_first:
+            brake_power = -0.05 if abs(surge) > 0.20 else -0.02
+            p1 = float(np.clip(brake_power, -1.0, 1.0))
+            p2 = float(np.clip(brake_power, -1.0, 1.0))
+        elif concentric_turn:
+            turn_sign = 1.0 if yaw_err >= 0.0 else -1.0
+            turn_power = 0.38 + 0.22 * float(np.clip(abs_yaw_err / np.pi, 0.0, 1.0))
+            if abs_yaw_err < brake_threshold:
+                turn_power *= 0.95
+            turn_power = float(np.clip(turn_power, 0.30, 0.58))
+            p1 = float(np.clip(-turn_sign * turn_power, -1.0, 1.0))
+            p2 = float(np.clip(turn_sign * turn_power, -1.0, 1.0))
+        else:
+            p1 = float(np.clip(base_power - yaw_cmd, -1.0, 1.0))
+            p2 = float(np.clip(base_power + yaw_cmd, -1.0, 1.0))
+
+        self._was_concentric_turn = bool(concentric_turn)
 
         depth_cmd = 0.22 * float(np.tanh(depth_err / 1.2)) - 0.12 * heave
         theta = float(np.clip(abs(depth_cmd), 0.0, np.radians(18.0)))

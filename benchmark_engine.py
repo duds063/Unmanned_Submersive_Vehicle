@@ -15,10 +15,12 @@ from geometry_engine import GeometryEngine
 from physics_engine import PhysicsEngine, VehicleState
 from sensor_engine import EKFState, Environment, ExtendedKalmanFilter, Obstacle, SensorEngine
 from control_engine import ControlEngine
+import control_engine as control_module
 from mpc_controller import integrate_mpc
 from rl_controller import integrate_rl
 from mission_engine import COLLISION_THRESHOLD, DynamicObstacle, EpisodeTermination
 from replay_exporter import ReplayExporter
+from vehicle_profiles import VehicleProfile, load_vehicle_profile
 
 
 DEFAULT_MAX_STEPS = 200000
@@ -38,16 +40,29 @@ class BenchmarkScenario:
     trials: int = 3
     pool_depth: float = 10.0
     pool_radius: float = 30.0
+    pool_shape: str = "circular"
+    pool_length: Optional[float] = None
+    pool_width: Optional[float] = None
     noise_scale: float = 0.5
     rayleigh_enabled: bool = True
     rayleigh_sigma: float = 0.03
     env_disturbance_scale: float = 0.5
+    env_spectral_enabled: bool = False
+    wave_hs: float = 0.0
     seed: int = 42
     benchmark_mode: str = DEFAULT_BENCHMARK_MODE
     hold_position: Optional[List[float]] = None
     position_tolerance_m: float = 0.20
     attitude_tolerance_deg: float = 12.0
+    obstacle_collision_threshold_m: float = COLLISION_THRESHOLD
+    boundary_collision_threshold_m: float = COLLISION_THRESHOLD
     use_truth_position_for_guidance: bool = False
+    vehicle_profile_csv: Optional[str] = None
+    surface_depth: Optional[float] = None
+    planar_dof: bool = False
+    lqr_tuning: Optional[Dict[str, float]] = None
+    lqr_guidance_tuning: Optional[Dict[str, float]] = None
+    mpc_tuning: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -191,15 +206,43 @@ class ControllerBenchmark:
         if mode not in BENCHMARK_MODES:
             raise ValueError(f"Unsupported benchmark_mode '{mode}'. Expected one of {BENCHMARK_MODES}.")
 
+        shape = str(getattr(scenario, "pool_shape", "circular") or "circular").lower()
+        if shape not in ("circular", "rectangle"):
+            raise ValueError("Unsupported pool_shape. Expected 'circular' or 'rectangle'.")
+        scenario.pool_shape = shape
+        if scenario.pool_shape == "rectangle":
+            if scenario.pool_length is None:
+                scenario.pool_length = float(2.0 * scenario.pool_radius)
+            if scenario.pool_width is None:
+                scenario.pool_width = float(2.0 * scenario.pool_radius)
+            scenario.pool_length = float(scenario.pool_length)
+            scenario.pool_width = float(scenario.pool_width)
+            if scenario.pool_length <= 0.0 or scenario.pool_width <= 0.0:
+                raise ValueError("pool_length and pool_width must be > 0 for rectangle pool_shape.")
+
         scenario.benchmark_mode = mode
         if scenario.hold_position is None and mode == "docking":
             scenario.hold_position = [1.0, 0.0, scenario.pool_depth / 2.0]
         elif scenario.hold_position is None:
-            scenario.hold_position = [0.0, 0.0, scenario.pool_depth / 2.0]
+            target_depth = scenario.surface_depth if scenario.surface_depth is not None else scenario.pool_depth / 2.0
+            scenario.hold_position = [0.0, 0.0, float(target_depth)]
         else:
             scenario.hold_position = [float(v) for v in scenario.hold_position]
         scenario.position_tolerance_m = float(scenario.position_tolerance_m)
         scenario.attitude_tolerance_deg = float(scenario.attitude_tolerance_deg)
+        scenario.obstacle_collision_threshold_m = float(scenario.obstacle_collision_threshold_m)
+        scenario.boundary_collision_threshold_m = float(scenario.boundary_collision_threshold_m)
+        scenario.env_spectral_enabled = bool(scenario.env_spectral_enabled)
+        scenario.wave_hs = float(max(0.0, scenario.wave_hs))
+        if scenario.surface_depth is not None:
+            scenario.surface_depth = float(scenario.surface_depth)
+        scenario.planar_dof = bool(scenario.planar_dof)
+        if scenario.lqr_tuning is not None:
+            scenario.lqr_tuning = {str(k): float(v) for k, v in dict(scenario.lqr_tuning).items()}
+        if scenario.lqr_guidance_tuning is not None:
+            scenario.lqr_guidance_tuning = {str(k): float(v) for k, v in dict(scenario.lqr_guidance_tuning).items()}
+        if scenario.mpc_tuning is not None:
+            scenario.mpc_tuning = {str(k): float(v) for k, v in dict(scenario.mpc_tuning).items()}
         return scenario
 
     def _run_once(
@@ -210,8 +253,22 @@ class ControllerBenchmark:
         trial_number: int,
     ) -> tuple[BenchmarkRunResult, Optional[Dict]]:
         rng = np.random.default_rng(seed)
-        geo = GeometryEngine(L=0.8, D=0.1)
-        physics = PhysicsEngine(geo, max_thruster_force=10.0)
+        profile = None
+        if scenario.vehicle_profile_csv:
+            profile = load_vehicle_profile(scenario.vehicle_profile_csv)
+            geo = GeometryEngine(L=profile.length_m, D=profile.beam_m)
+            physics = PhysicsEngine(
+                geo,
+                max_thruster_force=10.0,
+                rigid_body_mass=profile.mass_kg,
+                rigid_body_inertia=profile.inertia_kgm2,
+                thruster_port_position=profile.thruster_port_position_m,
+                thruster_starboard_position=profile.thruster_starboard_position_m,
+                planar_dof=scenario.planar_dof,
+            )
+        else:
+            geo = GeometryEngine(L=0.8, D=0.1)
+            physics = PhysicsEngine(geo, max_thruster_force=10.0, planar_dof=scenario.planar_dof)
         env = Environment(pool_depth=scenario.pool_depth, pool_radius=scenario.pool_radius)
         sensors = SensorEngine(
             env,
@@ -219,20 +276,67 @@ class ControllerBenchmark:
             rayleigh_sigma=scenario.rayleigh_sigma,
             enable_rayleigh=scenario.rayleigh_enabled,
             seed=seed,
+            wave_hs=scenario.wave_hs,
         )
         sensors.set_environmental_disturbance(
             enabled=scenario.rayleigh_enabled,
             scale=scenario.env_disturbance_scale,
             rayleigh_sigma=scenario.rayleigh_sigma,
+            spectral=scenario.env_spectral_enabled,
+            wave_hs=scenario.wave_hs,
         )
         ekf = ExtendedKalmanFilter(physics, pool_radius=scenario.pool_radius, pool_depth=scenario.pool_depth)
+
+        # Apply optional LQR guidance tuning before ControlEngine instantiates LQR.
+        try:
+            guidance_tuning = {}
+            module_guidance_tuning = getattr(control_module, 'LQR_GUIDANCE_TUNING', {})
+            if module_guidance_tuning:
+                guidance_tuning.update(dict(module_guidance_tuning))
+            if scenario.lqr_guidance_tuning:
+                guidance_tuning.update(dict(scenario.lqr_guidance_tuning))
+            control_module.LQR_GUIDANCE_TUNING = guidance_tuning
+        except Exception:
+            pass
+
         with self._quiet_stdout():
             control = ControlEngine(physics, hover_depth=scenario.pool_depth / 2.0)
             integrate_mpc(control, hover_depth=scenario.pool_depth / 2.0)
             hrl = integrate_rl(control, self.checkpoint_dir)
-        # Apply optional global LQR tuning (set benchmark_engine.GLOBAL_TUNING = {...})
+        control.set_pool_bounds(
+            pool_shape=scenario.pool_shape,
+            pool_radius=scenario.pool_radius,
+            pool_length=scenario.pool_length,
+            pool_width=scenario.pool_width,
+        )
+
+        # Apply optional global/scenario MPC tuning (set mpc_controller.MPC_TUNING or scenario.mpc_tuning).
+        try:
+            mpc_tuning = {}
+            module_mpc_tuning = getattr(__import__('mpc_controller'), 'MPC_TUNING', {})
+            if module_mpc_tuning:
+                mpc_tuning.update(dict(module_mpc_tuning))
+            if scenario.mpc_tuning:
+                mpc_tuning.update(dict(scenario.mpc_tuning))
+            if mpc_tuning and getattr(control, '_mpc', None) is not None:
+                control._mpc.tune_max_cruise_mult = float(mpc_tuning.get('max_cruise_mult', getattr(control._mpc, 'tune_max_cruise_mult', 1.0)))
+                control._mpc.tune_desired_surge_mult = float(mpc_tuning.get('desired_surge_mult', getattr(control._mpc, 'tune_desired_surge_mult', 1.0)))
+                control._mpc.tune_base_power_gain_mult = float(mpc_tuning.get('base_power_gain_mult', getattr(control._mpc, 'tune_base_power_gain_mult', 1.0)))
+                control._mpc.tune_lateral_yaw_mult = float(mpc_tuning.get('lateral_yaw_mult', getattr(control._mpc, 'tune_lateral_yaw_mult', 1.0)))
+                control._mpc.tune_yaw_error_mult = float(mpc_tuning.get('yaw_error_mult', getattr(control._mpc, 'tune_yaw_error_mult', 1.0)))
+                control._mpc.tune_yaw_damp_mult = float(mpc_tuning.get('yaw_damp_mult', getattr(control._mpc, 'tune_yaw_damp_mult', 1.0)))
+                control._mpc.tune_lateral_speed_penalty_mult = float(mpc_tuning.get('lateral_speed_penalty_mult', getattr(control._mpc, 'tune_lateral_speed_penalty_mult', 1.0)))
+                control._mpc.tune_reverse_penalty = float(mpc_tuning.get('reverse_penalty', getattr(control._mpc, 'tune_reverse_penalty', 0.55)))
+                control._mpc.tune_terminal_pull_mult = float(mpc_tuning.get('terminal_pull_mult', getattr(control._mpc, 'tune_terminal_pull_mult', 1.0)))
+                control._mpc.tune_boundary_margin_m = float(mpc_tuning.get('boundary_margin_m', getattr(control._mpc, 'tune_boundary_margin_m', 0.25)))
+        except Exception:
+            pass
+
+        # Apply optional global/scenario LQR tuning (set benchmark_engine.GLOBAL_TUNING or scenario.lqr_tuning).
         try:
             tuning = globals().get('GLOBAL_TUNING', {})
+            if scenario.lqr_tuning:
+                tuning = {**dict(tuning), **dict(scenario.lqr_tuning)}
             if tuning:
                 wt = control._lqr.weights
                 # apply simple multiplier keys if present
@@ -274,6 +378,7 @@ class ControllerBenchmark:
 
         waypoints = [np.array(wp, dtype=float) for wp in scenario.waypoints]
         hold_position = np.array(scenario.hold_position or [0.0, 0.0, scenario.pool_depth / 2.0], dtype=float)
+        start_depth = float(scenario.surface_depth if scenario.surface_depth is not None else scenario.pool_depth / 2.0)
         if scenario.benchmark_mode in ("stability", "docking"):
             control.set_reference(hold_position)
             hrl.set_waypoints([hold_position.copy()], waypoint_threshold=scenario.position_tolerance_m)
@@ -284,7 +389,7 @@ class ControllerBenchmark:
             with self._quiet_stdout():
                 control.set_controller(controller_name)
 
-        initial_state = VehicleState(z=scenario.pool_depth / 2.0)
+        initial_state = VehicleState(z=start_depth)
         physics.reset(initial_state)
         ekf.reset(np.concatenate([initial_state.eta, initial_state.nu]))
 
@@ -412,7 +517,7 @@ class ControllerBenchmark:
                 + 0.35 * abs(cmd.ballast_cmd)
             ) * scenario.dt
 
-            clearance_now = self._min_clearance_true(pos, scenario, static_obstacles, dynamic_obstacles)
+            boundary_clearance, obstacle_clearance, clearance_now = self._clearances(pos, scenario, static_obstacles, dynamic_obstacles)
             min_clearance = min(min_clearance, clearance_now)
 
             if scenario.benchmark_mode == "stability":
@@ -423,7 +528,10 @@ class ControllerBenchmark:
                 ):
                     stable_steps += 1
 
-            if clearance_now < COLLISION_THRESHOLD:
+            if (
+                boundary_clearance < scenario.boundary_collision_threshold_m
+                or obstacle_clearance < scenario.obstacle_collision_threshold_m
+            ):
                 termination = EpisodeTermination.COLLISION
             elif self._out_of_bounds(pos, scenario):
                 termination = EpisodeTermination.OUT_OF_BOUNDS
@@ -481,6 +589,9 @@ class ControllerBenchmark:
                     "environment": {
                         "pool_depth": float(scenario.pool_depth),
                         "pool_radius": float(scenario.pool_radius),
+                        "pool_shape": str(scenario.pool_shape),
+                        "pool_length": (None if scenario.pool_length is None else float(scenario.pool_length)),
+                        "pool_width": (None if scenario.pool_width is None else float(scenario.pool_width)),
                         "rayleigh_enabled": bool(scenario.rayleigh_enabled),
                         "rayleigh_sigma": float(scenario.rayleigh_sigma),
                         "env_disturbance_scale": float(scenario.env_disturbance_scale),
@@ -696,33 +807,51 @@ class ControllerBenchmark:
         )
 
     @staticmethod
-    def _min_clearance_true(
+    def _clearances(
         position: np.ndarray,
         scenario: BenchmarkScenario,
         static_obstacles: List[Obstacle],
         dynamic_obstacles: List[DynamicObstacle],
-    ) -> float:
+    ) -> tuple[float, float, float]:
         pos = np.asarray(position, dtype=float)
-        clearances = [
-            pos[2],
-            scenario.pool_depth - pos[2],
-            scenario.pool_radius - float(np.linalg.norm(pos[:2])),
-        ]
+        boundary_clearances = [ControllerBenchmark._horizontal_clearance(pos, scenario)]
+        if not scenario.planar_dof:
+            boundary_clearances.extend([
+                pos[2],
+                scenario.pool_depth - pos[2],
+            ])
 
+        obstacle_clearances = []
         for obs in static_obstacles:
-            clearances.append(float(np.linalg.norm(pos - obs.position) - obs.radius))
+            obstacle_clearances.append(float(np.linalg.norm(pos - obs.position) - obs.radius))
         for obs in dynamic_obstacles:
-            clearances.append(float(np.linalg.norm(pos - obs.position) - obs.radius))
+            obstacle_clearances.append(float(np.linalg.norm(pos - obs.position) - obs.radius))
 
-        return float(min(clearances))
+        min_boundary = float(min(boundary_clearances)) if boundary_clearances else float("inf")
+        min_obstacle = float(min(obstacle_clearances)) if obstacle_clearances else float("inf")
+        min_total = float(min(min_boundary, min_obstacle))
+        return min_boundary, min_obstacle, min_total
 
     @staticmethod
     def _out_of_bounds(position: np.ndarray, scenario: BenchmarkScenario) -> bool:
+        horizontal_clearance = ControllerBenchmark._horizontal_clearance(np.asarray(position, dtype=float), scenario)
+        if scenario.planar_dof:
+            return horizontal_clearance < 0.0
         return (
             position[2] < 0.0
             or position[2] > scenario.pool_depth
-            or float(np.linalg.norm(position[:2])) > scenario.pool_radius
+            or horizontal_clearance < 0.0
         )
+
+    @staticmethod
+    def _horizontal_clearance(position: np.ndarray, scenario: BenchmarkScenario) -> float:
+        if scenario.pool_shape == "rectangle":
+            half_length = 0.5 * float(scenario.pool_length)
+            half_width = 0.5 * float(scenario.pool_width)
+            clearance_x = half_length - abs(float(position[0]))
+            clearance_y = half_width - abs(float(position[1]))
+            return float(min(clearance_x, clearance_y))
+        return float(scenario.pool_radius - float(np.linalg.norm(position[:2])))
 
     @staticmethod
     def _score_run(
@@ -784,12 +913,20 @@ def _parse_args():
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--pool-depth", type=float, default=10.0)
     parser.add_argument("--pool-radius", type=float, default=30.0)
+    parser.add_argument("--pool-shape", type=str, default="circular", choices=["circular", "rectangle"])
+    parser.add_argument("--pool-length", type=float, default=None)
+    parser.add_argument("--pool-width", type=float, default=None)
+    parser.add_argument("--surface-depth", type=float, default=None)
     parser.add_argument("--noise-scale", type=float, default=0.5)
     parser.add_argument("--enable-rayleigh", action="store_true")
     parser.add_argument("--rayleigh-sigma", type=float, default=0.03)
     parser.add_argument("--env-disturbance-scale", type=float, default=0.0)
+    parser.add_argument("--env-spectral-enabled", action="store_true")
+    parser.add_argument("--wave-hs", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--controllers", nargs="*", default=["lqr", "mpc", "rl"])
+    parser.add_argument("--planar-dof", action="store_true")
+    parser.add_argument("--vehicle-profile-csv", type=str, default=None)
     parser.add_argument("--hold-position", nargs=3, metavar=("X", "Y", "Z"), type=float, default=None)
     parser.add_argument("--position-tolerance-m", type=float, default=0.20)
     parser.add_argument("--attitude-tolerance-deg", type=float, default=12.0)
@@ -834,6 +971,11 @@ def _load_scenario_file(path: Path) -> BenchmarkScenario:
     scenario_kwargs = {key: value for key, value in data.items() if key in valid_fields}
     if "waypoints" not in scenario_kwargs:
         raise ValueError("scenario-file must define 'waypoints'")
+    if scenario_kwargs.get("vehicle_profile_csv"):
+        vehicle_profile_csv = Path(str(scenario_kwargs["vehicle_profile_csv"]))
+        if not vehicle_profile_csv.is_absolute():
+            vehicle_profile_csv = (path.parent / vehicle_profile_csv).resolve()
+        scenario_kwargs["vehicle_profile_csv"] = str(vehicle_profile_csv)
     return BenchmarkScenario(**scenario_kwargs)
 
 
@@ -850,15 +992,23 @@ def _build_scenario_from_args(args) -> BenchmarkScenario:
         trials=int(args.trials),
         pool_depth=float(args.pool_depth),
         pool_radius=float(args.pool_radius),
+        pool_shape=str(args.pool_shape),
+        pool_length=(float(args.pool_length) if args.pool_length is not None else None),
+        pool_width=(float(args.pool_width) if args.pool_width is not None else None),
         noise_scale=float(args.noise_scale),
         rayleigh_enabled=bool(args.enable_rayleigh),
         rayleigh_sigma=float(args.rayleigh_sigma),
         env_disturbance_scale=float(args.env_disturbance_scale),
+        env_spectral_enabled=bool(args.env_spectral_enabled),
+        wave_hs=float(args.wave_hs),
         seed=int(args.seed),
         benchmark_mode=str(args.benchmark_mode),
         hold_position=([float(v) for v in args.hold_position] if args.hold_position else None),
         position_tolerance_m=float(args.position_tolerance_m),
         attitude_tolerance_deg=float(args.attitude_tolerance_deg),
+        surface_depth=(float(args.surface_depth) if args.surface_depth is not None else None),
+        planar_dof=bool(args.planar_dof),
+        vehicle_profile_csv=(str(args.vehicle_profile_csv) if args.vehicle_profile_csv else None),
     )
 
 

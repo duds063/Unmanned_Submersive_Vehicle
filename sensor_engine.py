@@ -333,11 +333,9 @@ class SensorEngine:
         self.spectral_enabled = False
         self.wave_num_harmonics = 8
         self.wave_peak_freq = 0.8
-        self.wave_hs = max(0.01, float(wave_hs))  # Significant Wave Height (m)
+        self.wave_hs = max(0.0, float(wave_hs))  # Significant Wave Height (m)
         self.wave_spectrum = 'jonswap'  # or 'pm' for Pierson-Moskowitz
         self.wave_amp_scale = 0.02
-        self.wave_hs = 0.2
-        self.wave_spectrum = 'jonswap'
         self._harmonic_freqs = None
         self._harmonic_phases = None
         self._harmonic_dirs = None
@@ -439,7 +437,7 @@ class SensorEngine:
         self.wave_peak_freq = float(wave_peak_freq)
         self.wave_amp_scale = float(wave_amp_scale)
         if wave_hs is not None:
-            self.wave_hs = max(0.01, float(wave_hs))
+            self.wave_hs = max(0.0, float(wave_hs))
 
         if (not self.enable_rayleigh) or self.environment_scale == 0.0:
             self._env_current_world[:] = 0.0

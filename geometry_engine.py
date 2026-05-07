@@ -91,28 +91,29 @@ class HydrodynamicCoefficients:
     """Coeficientes hidrodinâmicos no referencial do corpo."""
 
     # Coeficientes de arrasto quadrático (drag) — N/(m/s)²
-    X_uu: float   # surge
-    Y_vv: float   # sway
-    Z_ww: float   # heave
-    K_pp: float   # roll
-    M_qq: float   # pitch
-    N_rr: float   # yaw
+    # Definidos como 0.0 conforme nota da equipe (ainda em produção)
+    X_uu: float = 0.0   # surge
+    Y_vv: float = 0.0   # sway
+    Z_ww: float = 0.0   # heave
+    K_pp: float = 0.0   # roll
+    M_qq: float = 0.0   # pitch
+    N_rr: float = 0.0   # yaw
 
     # Coeficientes de arrasto linear (skin friction) — N/(m/s)
-    X_u: float
-    Y_v: float
-    Z_w: float
-    K_p: float
-    M_q: float
-    N_r: float
+    X_u: float = 0.0
+    Y_v: float = 0.0
+    Z_w: float = 0.0
+    K_p: float = 0.0
+    M_q: float = 0.0
+    N_r: float = 0.0
 
-    # Massa adicionada — kg e kg·m²
-    X_udot: float   # surge
-    Y_vdot: float   # sway
-    Z_wdot: float   # heave
-    K_pdot: float   # roll
-    M_qdot: float   # pitch
-    N_rdot: float   # yaw
+    # Massa adicionada — kg e kg·m² (Extraído da matriz de Added Mass)
+    X_udot: float = 1.1898    # surge
+    Y_vdot: float = 14.9220   # sway
+    Z_wdot: float = 49.6246   # heave
+    K_pdot: float = 3.9017    # roll
+    M_qdot: float = 3.9333    # pitch
+    N_rdot: float = 1.1902    # yaw
 
     def to_drag_matrix_quadratic(self) -> np.ndarray:
         """Retorna matriz diagonal de arrasto quadrático 6x6."""

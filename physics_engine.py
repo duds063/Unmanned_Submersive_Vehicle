@@ -22,6 +22,7 @@ Referências:
 
 import numpy as np
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Tuple, Optional
 from geometry_engine import GeometryEngine, HullGeometry, HydrodynamicCoefficients
 
@@ -279,34 +280,55 @@ class PhysicsEngine:
 
     def __init__(
         self,
-        geometry:           GeometryEngine,
+        geometry:           Optional[GeometryEngine] = None,
         max_thruster_force: float = 10.0,       # N
         components:         ComponentMasses = None,
         rho:                float = RHO_FRESHWATER,
         sim_speed_multiplier: float = 1.0,      # 1.0 = tempo real; >1 só pra debug visual
+        rigid_body_mass:    Optional[float] = None,
+        rigid_body_inertia:  Optional[np.ndarray] = None,
+        thruster_port_position: Optional[np.ndarray] = None,
+        thruster_starboard_position: Optional[np.ndarray] = None,
+        planar_dof:         bool = False,
+        vehicle_profile:    Optional[object] = None,
     ):
-        self.geo   = geometry
-        self.hull  = geometry.hull_geometry
-        self.coeff = geometry.coefficients
         self.rho   = rho
+        self.planar_dof = bool(planar_dof)
+
+        if geometry is None:
+            if vehicle_profile is None:
+                raise ValueError("geometry or vehicle_profile must be provided")
+            self.geo = None
+            self.hull = self._build_hull_from_vehicle_profile(vehicle_profile)
+            self.coeff = self._build_coefficients_from_vehicle_profile(vehicle_profile)
+        else:
+            self.geo   = geometry
+            self.hull  = geometry.hull_geometry
+            self.coeff = geometry.coefficients
 
         self.components = components or ComponentMasses()
+        self._rigid_body_mass = float(rigid_body_mass) if rigid_body_mass is not None else (self.hull.mass_hull + self.components.total)
+        self._rigid_body_inertia = None if rigid_body_inertia is None else np.asarray(rigid_body_inertia, dtype=float)
+        if self._rigid_body_inertia is not None and self._rigid_body_inertia.shape != (3, 3):
+            raise ValueError("rigid_body_inertia must be a 3x3 matrix")
         self.ballast    = BallastSystem(
             hull_volume=self.hull.volume,
             rho_fluid=rho,
-            base_mass=self.hull.mass_hull + self.components.total,
+            base_mass=self._rigid_body_mass,
             sim_speed_multiplier=sim_speed_multiplier,
         )
         # Dois thrusters laterais na altura do CG para recuperar autoridade
         # de roll/yaw sem deslocar longitudinalmente o thrust do centro de massa.
         lateral_arm = max(0.03, 0.4 * self.hull.R)
+        port_position = np.array([0.0, +lateral_arm, 0.0], dtype=float) if thruster_port_position is None else np.asarray(thruster_port_position, dtype=float)
+        starboard_position = np.array([0.0, -lateral_arm, 0.0], dtype=float) if thruster_starboard_position is None else np.asarray(thruster_starboard_position, dtype=float)
         self.thruster_port = Thruster(
             max_force=max_thruster_force,
-            position_body=np.array([0.0, +lateral_arm, 0.0], dtype=float),
+            position_body=port_position,
         )
         self.thruster_starboard = Thruster(
             max_force=max_thruster_force,
-            position_body=np.array([0.0, -lateral_arm, 0.0], dtype=float),
+            position_body=starboard_position,
         )
 
         self._state = VehicleState()
@@ -329,6 +351,80 @@ class PhysicsEngine:
         self._prev_env_current_body = self._env_current_body.copy()
         self._env_dt = 0.0
 
+    @classmethod
+    def from_vehicle_profile(
+        cls,
+        vehicle_profile: object,
+        max_thruster_force: float = 10.0,
+        components: ComponentMasses = None,
+        rho: float = RHO_FRESHWATER,
+        sim_speed_multiplier: float = 1.0,
+        planar_dof: bool = False,
+    ):
+        return cls(
+            geometry=None,
+            max_thruster_force=max_thruster_force,
+            components=components,
+            rho=rho,
+            sim_speed_multiplier=sim_speed_multiplier,
+            rigid_body_mass=getattr(vehicle_profile, "mass_kg", None),
+            rigid_body_inertia=getattr(vehicle_profile, "inertia_kgm2", None),
+            thruster_port_position=getattr(vehicle_profile, "thruster_port_position_m", None),
+            thruster_starboard_position=getattr(vehicle_profile, "thruster_starboard_position_m", None),
+            planar_dof=planar_dof,
+            vehicle_profile=vehicle_profile,
+        )
+
+    def _build_hull_from_vehicle_profile(self, vehicle_profile: object):
+        length = float(getattr(vehicle_profile, "length_m", 1.0))
+        beam_total = float(getattr(vehicle_profile, "beam_total_m", getattr(vehicle_profile, "beam_m", 0.2) * 2.0))
+        radius = max(0.01, 0.5 * beam_total)
+        volume = float(getattr(vehicle_profile, "metadata", {}).get("hydro", {}).get("displaced_volume_m3", radius * radius * length * 0.35))
+        mass_hull = float(getattr(vehicle_profile, "mass_kg", volume * self.rho))
+        return SimpleNamespace(
+            L=length,
+            R=radius,
+            volume=volume,
+            mass_hull=mass_hull,
+            L_D_ratio=length / max(1e-6, beam_total),
+            A_frontal=np.pi * radius ** 2,
+            A_lateral=length * beam_total,
+        )
+
+    def _build_coefficients_from_vehicle_profile(self, vehicle_profile: object):
+        hydro = getattr(vehicle_profile, "metadata", {}).get("hydro", {}) or {}
+
+        def diag_from_matrix(matrix, index):
+            try:
+                return float(np.asarray(matrix, dtype=float)[index, index])
+            except Exception:
+                return 0.0
+
+        linear = hydro.get("linear_damping_matrix")
+        quadratic = hydro.get("quadratic_damping_matrix")
+        added_mass = hydro.get("added_mass_6x6")
+
+        return HydrodynamicCoefficients(
+            X_uu=diag_from_matrix(quadratic, 0),
+            Y_vv=diag_from_matrix(quadratic, 1),
+            Z_ww=diag_from_matrix(quadratic, 2),
+            K_pp=diag_from_matrix(quadratic, 3),
+            M_qq=diag_from_matrix(quadratic, 4),
+            N_rr=diag_from_matrix(quadratic, 5),
+            X_u=diag_from_matrix(linear, 0),
+            Y_v=diag_from_matrix(linear, 1),
+            Z_w=diag_from_matrix(linear, 2),
+            K_p=diag_from_matrix(linear, 3),
+            M_q=diag_from_matrix(linear, 4),
+            N_r=diag_from_matrix(linear, 5),
+            X_udot=diag_from_matrix(added_mass, 0),
+            Y_vdot=diag_from_matrix(added_mass, 1),
+            Z_wdot=diag_from_matrix(added_mass, 2),
+            K_pdot=diag_from_matrix(added_mass, 3),
+            M_qdot=diag_from_matrix(added_mass, 4),
+            N_rdot=diag_from_matrix(added_mass, 5),
+        )
+
     # ─── Interface pública ───────────────────
 
     @property
@@ -341,8 +437,7 @@ class PhysicsEngine:
 
     @property
     def total_mass(self) -> float:
-        return (self.hull.mass_hull +
-                self.components.total +
+        return (self._rigid_body_mass +
                 self.ballast.water_mass)
 
     def step(
@@ -441,17 +536,23 @@ class PhysicsEngine:
         Matriz de massa e inércia total M = M_rigid + M_added.
         Inclui massa atual do lastro.
         """
-        m   = self.total_mass
-        L   = self.hull.L
-        R   = self.hull.R
-        c   = self.coeff
+        m = self.total_mass
+        c = self.coeff
 
-        # momentos de inércia do casco aproximado como casca cilíndrica
-        Ixx = 0.7  * m * R**2                          # roll
-        Iyy = (1/12) * m * (3*R**2 + L**2)            # pitch
-        Izz = Iyy                                       # yaw — simetria
+        if self._rigid_body_inertia is not None:
+            M_rigid = np.zeros((6, 6), dtype=float)
+            M_rigid[:3, :3] = np.diag([m, m, m])
+            M_rigid[3:, 3:] = self._rigid_body_inertia
+        else:
+            L = self.hull.L
+            R = self.hull.R
 
-        M_rigid = np.diag([m, m, m, Ixx, Iyy, Izz])
+            # momentos de inércia do casco aproximado como casca cilíndrica
+            Ixx = 0.7  * m * R**2                          # roll
+            Iyy = (1/12) * m * (3*R**2 + L**2)            # pitch
+            Izz = Iyy                                       # yaw — simetria
+
+            M_rigid = np.diag([m, m, m, Ixx, Iyy, Izz])
         M_added = np.diag([
             c.X_udot, c.Y_vdot, c.Z_wdot,
             c.K_pdot, c.M_qdot, c.N_rdot
@@ -688,6 +789,10 @@ class PhysicsEngine:
 
         eta_dot = J @ nu
         nu_dot  = self._M_inv @ (tau - C @ nu - D @ nu_for_drag - g)
+
+        if self.planar_dof:
+            eta_dot[2:5] = 0.0
+            nu_dot[2:5] = 0.0
 
         return eta_dot, nu_dot
 
