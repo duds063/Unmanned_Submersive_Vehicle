@@ -1,0 +1,36 @@
+### HIL configuration template
+# Example configuration for the HIL bridges and telemetry
+
+bridge:
+  type: udp            # options: udp | serial | mock
+
+  # UDP settings (used when type: udp)
+  udp:
+    bind_host: 0.0.0.0
+    bind_port: 5005
+    mode: json        # options: json | binary
+
+  # Serial settings (used when type: serial)
+  serial:
+    port: /dev/ttyUSB0
+    baudrate: 115200
+    mode: json        # options: json | binary
+
+  # Mock settings (for local testing)
+  mock:
+    latency_s: 0.001
+
+telemetry:
+  enabled: true
+  host: 127.0.0.1
+  port: 6000
+  rate_hz: 10
+
+sensor:
+  accept_binary_frames: true
+  packet_loss_prob: 0.0
+  latency_s: 0.0
+
+mixer:
+  type: default
+  params: {}

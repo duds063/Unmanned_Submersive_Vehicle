@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - plotting is optional at runtime
     plt = None
 
 from physics_engine import PhysicsEngine, VehicleState
-from rl_controller import ActorCritic, PPOUpdater, RolloutBuffer
+from rl_controller import ActorCritic, PPOUpdater, RolloutBuffer, Adam
 from vehicle_profiles import load_taluy_profile
 
 
@@ -62,8 +62,8 @@ def _to_jsonable(obj):
 class BarrelRollConfig:
     phases: Tuple[int, ...] = (1, 2, 3)
     cycles: int = 1
-    phase_steps: int = 4096
-    episodes: int = 300
+    phase_steps: int = 8192
+    episodes: int = 600
     episode_steps: int = 320
     dt: float = 0.02
     seed: int = 42
@@ -76,38 +76,60 @@ class BarrelRollConfig:
     initial_attitude_jitter: float = 0.04
 
     target_turns: float = 1.0
-    curriculum_stages: Tuple[float, float, float] = (0.25, 0.75, 1.5)
+    # Roll-first curriculum: learn to initiate the turn before tightening the target.
+    curriculum_stages: Tuple[float, float, float] = (0.05, 0.20, 1.0)
     curriculum_breakpoints: Tuple[float, float] = (0.35, 0.70)
 
-    max_thruster_force: float = 12.0
+    max_thruster_force: float = 60.0
     max_tilt_deg: float = 60.0
     hover_depth_safety: float = 0.75
     pitch_safety_deg: float = 100.0
+    # "per_thruster" preserves the legacy Taluy action layout. "paired"
+    # exposes the compact port/starboard command space for experiments.
+    action_layout: str = "per_thruster"
     vehicle_profile_source: str = "asset_zoo/vehicles/taluy/taluy_mjcf.xml"
     env_force_gain: float = 1.0
     env_turbulence_gain: float = 1.0
     env_wave_freq: float = 0.8
     enable_domain_randomization: bool = False
 
-    roll_progress_weight: float = 50.0
-    roll_track_weight: float = 10.0
-    roll_velocity_weight: float = 5.0
-    depth_weight: float = 0.2
-    speed_weight: float = 0.1
-    attitude_penalty: float = 0.01
-    stability_penalty: float = 0.005
+    roll_progress_weight: float = 300.0
+    roll_track_weight: float = 0.4
+    roll_velocity_weight: float = 0.10
+    depth_weight: float = 0.05
+    speed_weight: float = 0.03
+    attitude_penalty: float = 0.008
+    stability_penalty: float = 0.003
     action_penalty: float = 0.002
-    completion_bonus: float = 20.0
+    reverse_roll_penalty_weight: float = 0.0
+    terminal_progress_weight: float = 0.0
+    completion_bonus: float = 80.0
+    # episodic penalty / completion tuning
+    episodic_penalty_mult: float = 3.0
+    required_min_roll: float = 1.0
 
     gamma: float = 0.99
     lam: float = 0.95
     lr: float = 3e-4
+    value_lr: Optional[float] = None
+    value_clip: float = 50.0
+
+    # reward scaling/clipping to limit value magnitudes during training
+    reward_scale: float = 1.0
+    reward_clip: float = 2000.0
 
     save_every: int = 25
     eval_episodes: int = 8
     checkpoint_dir: str = "./checkpoints/barrel_roll"
     output_dir: str = "./training_runs"
     fresh: bool = False
+    demo_warmstart_rollouts: int = 0
+    demo_warmstart_segments: int = 4
+    demo_warmstart_top_k: int = 4
+    demo_warmstart_epochs: int = 24
+    demo_warmstart_batch_size: int = 64
+    demo_warmstart_actor_lr: float = 1e-3
+    demo_warmstart_success_only: bool = True
 
 
 @dataclass
@@ -126,11 +148,12 @@ class EpisodeSummary:
 
 class BarrelRollEnvironment:
     OBS_DIM = 15
-    ACTION_DIM = 7
+    ACTION_DIM = 7  # default fallback; actual dim set per-instance in __init__
 
     def __init__(self, config: BarrelRollConfig, physics: Optional[PhysicsEngine] = None):
         self.config = config
         self.rng = np.random.default_rng(config.seed)
+        self.action_layout = str(getattr(config, "action_layout", "paired")).strip().lower()
 
         if physics is None:
             profile = load_taluy_profile(config.vehicle_profile_source)
@@ -142,6 +165,20 @@ class BarrelRollEnvironment:
         else:
             self.physics = physics
             self.profile = None
+
+        # The physics interface currently exposes paired port/starboard control.
+        # Keep the legacy per-thruster aggregated layout available for sweeps,
+        # but default Taluy training to the compact paired action space.
+        n_thrusters = len(getattr(self.physics, 'thrusters', []) or [None, None])
+        if n_thrusters < 2:
+            n_thrusters = 2
+        self.n_thrusters = n_thrusters
+        if self.action_layout == "paired":
+            self.ACTION_DIM = 7
+        elif self.action_layout == "per_thruster":
+            self.ACTION_DIM = 3 * n_thrusters + 1
+        else:
+            raise ValueError(f"Unsupported action_layout: {self.action_layout}")
 
         self.target_roll = 2.0 * np.pi * float(config.target_turns)
         self.current_target_roll = self.target_roll
@@ -215,14 +252,86 @@ class BarrelRollEnvironment:
         tilt_limit = np.radians(self.config.max_tilt_deg)
         power_scale = float(self.thruster_scale)
 
+        # Legacy dual-thruster format (7 elements)
+        if action.size == 7:
+            return {
+                "thruster_power": float(np.clip(power_scale * action[0], -1.0, 1.0)),
+                "thruster_theta": float((action[1] + 1.0) * 0.5 * tilt_limit),
+                "thruster_phi": float((action[2] + 1.0) * 0.5 * 2.0 * np.pi),
+                "ballast_cmd": float(action[3]),
+                "thruster2_power": float(np.clip(power_scale * action[4], -1.0, 1.0)),
+                "thruster2_theta": float((action[5] + 1.0) * 0.5 * tilt_limit),
+                "thruster2_phi": float((action[6] + 1.0) * 0.5 * 2.0 * np.pi),
+            }
+
+        # Per-thruster format: [p0,t0,phi0, p1,t1,phi1, ..., ballast]
+        # Expect length = 3*N + 1
+        if (action.size - 1) % 3 == 0 and action.size >= 4:
+            n_in = (action.size - 1) // 3
+            thrusters = getattr(self.physics, 'thrusters', None)
+            if thrusters is None:
+                # fallback: aggregate evenly into two channels
+                half = max(1, n_in // 2)
+                p_port = float(np.sum(action[0:3*half:3]))
+                p_star = float(np.sum(action[3*half:3*n_in:3]))
+                t1 = float(np.mean(action[1:3*half:3]) if half > 0 else 0.0)
+                t2 = float(np.mean(action[3*half+1:3*n_in:3]) if (n_in-half) > 0 else 0.0)
+                f1 = float(np.mean((action[2:3*half:3] + 1.0) * 0.5 * 2.0 * np.pi) if half > 0 else 0.0)
+                f2 = float(np.mean((action[3*half+2:3*n_in:3] + 1.0) * 0.5 * 2.0 * np.pi) if (n_in-half) > 0 else 0.0)
+            else:
+                # map thruster indices to port/star by position_body.y sign
+                port_idxs = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) > 0.0]
+                star_idxs = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) <= 0.0]
+                if not port_idxs:
+                    port_idxs = [0]
+                if not star_idxs:
+                    star_idxs = [min(len(thrusters)-1, 1)]
+
+                # accumulate per-side
+                p_port = 0.0
+                p_star = 0.0
+                t1_vals = []
+                t2_vals = []
+                f1_vals = []
+                f2_vals = []
+                for i in range(len(thrusters)):
+                    if i < n_in:
+                        p = float(action[3*i + 0])
+                        t = float((action[3*i + 1] + 1.0) * 0.5 * tilt_limit)
+                        f = float((action[3*i + 2] + 1.0) * 0.5 * 2.0 * np.pi)
+                        if i in port_idxs:
+                            p_port += p
+                            t1_vals.append(t)
+                            f1_vals.append(f)
+                        else:
+                            p_star += p
+                            t2_vals.append(t)
+                            f2_vals.append(f)
+
+                t1 = float(np.mean(t1_vals) if t1_vals else 0.0)
+                t2 = float(np.mean(t2_vals) if t2_vals else 0.0)
+                f1 = float(np.mean(f1_vals) if f1_vals else 0.0)
+                f2 = float(np.mean(f2_vals) if f2_vals else 0.0)
+
+            return {
+                "thruster_power": float(np.clip(power_scale * p_port, -1.0, 1.0)),
+                "thruster_theta": float(np.clip(t1, 0.0, tilt_limit)),
+                "thruster_phi": float(f1),
+                "ballast_cmd": float(action[-1]),
+                "thruster2_power": float(np.clip(power_scale * p_star, -1.0, 1.0)),
+                "thruster2_theta": float(np.clip(t2, 0.0, tilt_limit)),
+                "thruster2_phi": float(f2),
+            }
+
+        # fallback to zeros
         return {
-            "thruster_power": float(np.clip(power_scale * action[0], -1.0, 1.0)),
-            "thruster_theta": float((action[1] + 1.0) * 0.5 * tilt_limit),
-            "thruster_phi": float((action[2] + 1.0) * 0.5 * 2.0 * np.pi),
-            "ballast_cmd": float(action[3]),
-            "thruster2_power": float(np.clip(power_scale * action[4], -1.0, 1.0)),
-            "thruster2_theta": float((action[5] + 1.0) * 0.5 * tilt_limit),
-            "thruster2_phi": float((action[6] + 1.0) * 0.5 * 2.0 * np.pi),
+            "thruster_power": 0.0,
+            "thruster_theta": 0.0,
+            "thruster_phi": 0.0,
+            "ballast_cmd": 0.0,
+            "thruster2_power": 0.0,
+            "thruster2_theta": 0.0,
+            "thruster2_phi": 0.0,
         }
 
     def _current_stage_turns(self, episode_index: int, total_episodes: int) -> float:
@@ -260,11 +369,18 @@ class BarrelRollEnvironment:
         target_tracking = math.exp(-abs(roll_error) / max(0.35, 0.1 * self.current_target_roll))
         depth_reward = math.exp(-((depth_error / max(self.config.hover_depth_safety, 1e-6)) ** 2))
         speed_reward = math.exp(-((speed_error / max(0.25, self.config.target_speed)) ** 2))
+        phase_ratio = min(1.0, self.current_target_roll / max(self.target_roll, 1e-6))
+        auxiliary_scale = 0.35 + 0.65 * phase_ratio
 
         # compute component-level values for logging and diagnostic
-        roll_progress_reward = roll_delta / max(1e-6, self.current_target_roll)
-        roll_velocity_error = abs(state.p - (self.current_target_roll / max(self.config.episode_steps * self.config.dt, 1e-6)))
-        roll_velocity_reward = math.exp(-roll_velocity_error / max(0.5, 1.0))
+        # Reward forward progress but explicitly penalize backtracking so the
+        # policy cannot farm shaping with forward/back oscillations.
+        roll_progress_reward = max(0.0, roll_delta) / max(1e-6, self.current_target_roll)
+        reverse_roll_penalty = max(0.0, -roll_delta) / max(1e-6, self.current_target_roll)
+        roll_rate_target = self.current_target_roll / max(self.config.episode_steps * self.config.dt, 1e-6)
+        # reward positive roll rate in the desired direction, penalize reversals/oscillation
+        roll_velocity_raw = float(state.p)
+        roll_velocity_reward = float(max(0.0, roll_velocity_raw / max(1e-6, roll_rate_target)))
 
         attitude_penalty = (state.tht ** 2 + 0.5 * state.psi ** 2)
         stability_penalty = 0.10 * state.q ** 2 + 0.10 * state.r ** 2 + 0.05 * state.v ** 2 + 0.05 * state.w ** 2
@@ -273,24 +389,31 @@ class BarrelRollEnvironment:
         # components
         roll_progress_component = float(self.config.roll_progress_weight * roll_progress_reward)
         roll_track_component = float(self.config.roll_track_weight * target_tracking)
-        roll_velocity_component = float(getattr(self.config, 'roll_velocity_weight', 3.0) * roll_velocity_reward)
-        depth_component = float(self.config.depth_weight * depth_reward)
-        speed_component = float(self.config.speed_weight * speed_reward)
-        attitude_component = float(-self.config.attitude_penalty * attitude_penalty)
-        stability_component = float(-self.config.stability_penalty * stability_penalty)
+        roll_velocity_component = float(self.config.roll_velocity_weight * roll_velocity_reward)
+        reverse_roll_component = float(-self.config.reverse_roll_penalty_weight * reverse_roll_penalty)
+        depth_component = float(self.config.depth_weight * auxiliary_scale * depth_reward)
+        speed_component = float(self.config.speed_weight * auxiliary_scale * speed_reward)
+        attitude_component = float(-self.config.attitude_penalty * auxiliary_scale * attitude_penalty)
+        stability_component = float(-self.config.stability_penalty * auxiliary_scale * stability_penalty)
         action_component = float(-self.config.action_penalty * action_penalty)
 
-        # base reward is sum of components; completion bonus and episodic penalty applied below
-        reward = (
+        # dense shaping reward is scaled independently from terminal signals
+        shaping_reward = (
             roll_progress_component
             + roll_track_component
             + roll_velocity_component
+            + reverse_roll_component
             + depth_component
             + speed_component
             + attitude_component
             + stability_component
             + action_component
         )
+
+        reward = float(shaping_reward)
+        reward = float(reward * float(self.config.reward_scale))
+        if float(self.config.reward_clip) > 0.0:
+            reward = float(np.clip(reward, -float(self.config.reward_clip), float(self.config.reward_clip)))
 
         success = False
         if not self.completion_awarded and self.roll_progress >= self.current_target_roll:
@@ -301,12 +424,22 @@ class BarrelRollEnvironment:
 
         # EPISODIC PENALTY: applied only on final step of episode
         episodic_penalty = 0.0
+        terminal_progress_component = 0.0
         if (step_index + 1) == self.config.episode_steps:
-            required_min_roll = self.current_target_roll * 0.3  # Must roll at least 30% of target
+            completed_ratio = float(np.clip(self.roll_progress / max(1e-6, self.current_target_roll), 0.0, 1.0))
+            terminal_progress_component = float(self.config.terminal_progress_weight * (completed_ratio - 1.0))
+            reward = reward + terminal_progress_component
+
+            required_min_roll = self.current_target_roll * float(self.config.required_min_roll)
             if self.roll_progress < required_min_roll:
                 insufficient_roll = required_min_roll - self.roll_progress
-                episodic_penalty = float(insufficient_roll * 5.0)  # Gentle linear penalty
+                terminal_scale = 0.25 + 0.75 * min(1.0, self.current_target_roll / max(self.target_roll, 1e-6))
+                episodic_penalty = float(insufficient_roll * float(self.config.episodic_penalty_mult) * terminal_scale)
                 reward = reward - episodic_penalty
+
+            # keep terminal penalties visible even when shaping is scaled down
+            if float(self.config.reward_clip) > 0.0:
+                reward = float(np.clip(reward, -float(self.config.reward_clip), float(self.config.reward_clip)))
 
         pitch_limit = np.radians(self.config.pitch_safety_deg)
         done = False
@@ -331,11 +464,13 @@ class BarrelRollEnvironment:
             "roll_progress": roll_progress_component,
             "roll_track": roll_track_component,
             "roll_velocity": roll_velocity_component,
+            "reverse_roll": reverse_roll_component,
             "depth": depth_component,
             "speed": speed_component,
             "attitude": attitude_component,
             "stability": stability_component,
             "action": action_component,
+            "terminal_progress": terminal_progress_component,
             "episodic_penalty": episodic_penalty,
             "total": float(reward),
         }
@@ -349,15 +484,23 @@ class BarrelRollTrainer:
         np.random.seed(config.seed)
 
         self.env = BarrelRollEnvironment(config)
-        self.network = ActorCritic(obs_dim=self.env.OBS_DIM, action_dim=self.env.ACTION_DIM, hidden=[64, 64])
+        # bound critic outputs using config.value_clip to avoid extreme value predictions
+        self.network = ActorCritic(
+            obs_dim=self.env.OBS_DIM,
+            action_dim=self.env.ACTION_DIM,
+            hidden=[64, 64],
+            value_scale=float(config.value_clip) if getattr(config, 'value_clip', None) is not None else None,
+        )
         self.updater = PPOUpdater(
             self.network,
             lr=config.lr,
             clip_eps=0.2,
             entropy_coef=0.01,
-            value_coef=0.5,
-            n_epochs=10,
+            value_coef=0.25,
+            n_epochs=3,
             batch_size=64,
+            value_lr=config.value_lr,
+            value_clip=config.value_clip,
         )
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
@@ -388,6 +531,214 @@ class BarrelRollTrainer:
         mean, _, _ = self.network.forward(obs, normalize=True, update_obs_stats=False)
         return np.asarray(mean, dtype=float)
 
+    @staticmethod
+    def _episode_score(summary: EpisodeSummary) -> Tuple[float, float, float]:
+        return (
+            1.0 if summary.success else 0.0,
+            float(summary.roll_turns),
+            float(summary.reward),
+        )
+
+    @staticmethod
+    def _aggregate_score(metrics: Dict[str, float]) -> Tuple[float, float, float]:
+        return (
+            float(metrics.get("success_rate", 0.0)),
+            float(metrics.get("roll_turns_mean", 0.0)),
+            float(metrics.get("reward_mean", 0.0)),
+        )
+
+    def _warmstart_report_path(self) -> Path:
+        return self.output_dir / "barrel_roll_warmstart_report.json"
+
+    def collect_demo_trajectories(
+        self,
+        rollouts: int,
+        segments: int,
+        top_k: int,
+        success_only: bool = True,
+    ) -> Dict[str, object]:
+        demo_env = BarrelRollEnvironment(self.config)
+        demo_env.rng = np.random.default_rng(self.config.seed + 101)
+        rng = np.random.default_rng(self.config.seed + 2025)
+        segments = max(1, int(segments))
+        seg_len = max(1, int(math.ceil(self.config.episode_steps / segments)))
+
+        candidates: List[Dict[str, object]] = []
+        success_count = 0
+
+        for rollout_idx in range(max(1, int(rollouts))):
+            obs = demo_env.reset(float(self.config.target_turns), training=False)
+            seq = rng.uniform(-1.0, 1.0, size=(segments, demo_env.ACTION_DIM))
+            obs_trace: List[np.ndarray] = []
+            action_trace: List[np.ndarray] = []
+            total_reward = 0.0
+            success = False
+            last_info: Dict[str, float] = {"roll_turns": 0.0, "depth_error": 0.0}
+
+            for step in range(self.config.episode_steps):
+                action = np.asarray(seq[min(step // seg_len, segments - 1)], dtype=float)
+                obs_trace.append(np.asarray(obs, dtype=float))
+                action_trace.append(action.copy())
+                obs, reward, done, info = demo_env.step(action, step)
+                total_reward += float(reward)
+                success = success or bool(info.get("success", 0.0))
+                last_info = info
+                if done:
+                    break
+
+            if success:
+                success_count += 1
+
+            candidates.append(
+                {
+                    "rollout": rollout_idx + 1,
+                    "success": bool(success),
+                    "roll_turns": float(last_info.get("roll_turns", 0.0)),
+                    "reward": float(total_reward),
+                    "depth_error_abs": abs(float(last_info.get("depth_error", 0.0))),
+                    "pitch_deg_abs": abs(float(np.degrees(demo_env.physics.state.tht))),
+                    "steps": len(obs_trace),
+                    "observations": np.asarray(obs_trace, dtype=float),
+                    "actions": np.asarray(action_trace, dtype=float),
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                1.0 if bool(item["success"]) else 0.0,
+                float(item["roll_turns"]),
+                float(item["reward"]),
+            ),
+            reverse=True,
+        )
+        if success_only and success_count > 0:
+            selected = [item for item in candidates if bool(item["success"])][: max(1, int(top_k))]
+        else:
+            selected = candidates[: max(1, int(top_k))]
+
+        if selected:
+            demo_obs = np.concatenate([item["observations"] for item in selected], axis=0)
+            demo_actions = np.concatenate([item["actions"] for item in selected], axis=0)
+        else:
+            demo_obs = np.zeros((0, self.env.OBS_DIM), dtype=float)
+            demo_actions = np.zeros((0, self.env.ACTION_DIM), dtype=float)
+
+        selected_summary = [
+            {
+                "rollout": int(item["rollout"]),
+                "success": bool(item["success"]),
+                "roll_turns": float(item["roll_turns"]),
+                "reward": float(item["reward"]),
+                "depth_error_abs": float(item["depth_error_abs"]),
+                "pitch_deg_abs": float(item["pitch_deg_abs"]),
+                "steps": int(item["steps"]),
+            }
+            for item in selected
+        ]
+
+        return {
+            "rollouts": int(rollouts),
+            "segments": int(segments),
+            "success_count": int(success_count),
+            "best_roll_turns": float(candidates[0]["roll_turns"]) if candidates else 0.0,
+            "selected_count": int(len(selected)),
+            "selected_success_count": int(sum(1 for item in selected if bool(item["success"]))),
+            "selected": selected_summary,
+            "observations": demo_obs,
+            "actions": demo_actions,
+        }
+
+    def warmstart_actor_from_demos(
+        self,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        epochs: int,
+        batch_size: int,
+        actor_lr: float,
+    ) -> Dict[str, float]:
+        obs_arr = np.asarray(observations, dtype=float)
+        act_arr = np.asarray(actions, dtype=float)
+        if obs_arr.size == 0 or act_arr.size == 0:
+            return {"samples": 0, "epochs": 0, "loss_initial": float("nan"), "loss_final": float("nan")}
+
+        for obs in obs_arr:
+            self.network.normalize_obs(np.asarray(obs, dtype=float), update_stats=True)
+
+        optimizer = Adam(
+            self.network.backbone.parameters() + self.network.actor_head.parameters(),
+            lr=float(actor_lr),
+        )
+
+        def _loss_for_batch(obs_b: np.ndarray, act_b: np.ndarray) -> float:
+            norm_obs = np.asarray([self.network.normalize_obs(obs, update_stats=False) for obs in obs_b], dtype=float)
+            h = self.network.backbone.forward(norm_obs)
+            mean = np.tanh(self.network.actor_head.forward(h))
+            return float(0.5 * np.mean(np.square(mean - act_b)))
+
+        loss_initial = _loss_for_batch(obs_arr, act_arr)
+        losses: List[float] = []
+
+        n_samples = len(obs_arr)
+        batch_size = max(1, int(batch_size))
+        epochs = max(1, int(epochs))
+        for _ in range(epochs):
+            perm = np.random.permutation(n_samples)
+            for start in range(0, n_samples, batch_size):
+                idx = perm[start:start + batch_size]
+                obs_b = obs_arr[idx]
+                act_b = act_arr[idx]
+                norm_obs = np.asarray([self.network.normalize_obs(obs, update_stats=False) for obs in obs_b], dtype=float)
+
+                h = self.network.backbone.forward(norm_obs)
+                mean = np.tanh(self.network.actor_head.forward(h))
+                diff = mean - act_b
+                loss = float(0.5 * np.mean(np.square(diff)))
+                losses.append(loss)
+
+                grad_mean = diff / max(1.0, float(diff.shape[0] * diff.shape[1]))
+                grad_pre_tanh = grad_mean * (1.0 - mean ** 2)
+
+                self.network.zero_grad()
+                grad_backbone = self.network.actor_head.backward(grad_pre_tanh)
+                self.network.backbone.backward(grad_backbone)
+                optimizer.step(max_grad_norm=0.5)
+                optimizer.zero_grad()
+
+        loss_final = _loss_for_batch(obs_arr, act_arr)
+        return {
+            "samples": int(n_samples),
+            "epochs": int(epochs),
+            "loss_initial": float(loss_initial),
+            "loss_final": float(loss_final),
+            "loss_mean": float(np.mean(losses)) if losses else float("nan"),
+        }
+
+    def demo_warmstart(self) -> Dict[str, object]:
+        if int(getattr(self.config, "demo_warmstart_rollouts", 0)) <= 0:
+            return {}
+
+        search = self.collect_demo_trajectories(
+            rollouts=int(self.config.demo_warmstart_rollouts),
+            segments=int(self.config.demo_warmstart_segments),
+            top_k=int(self.config.demo_warmstart_top_k),
+            success_only=bool(self.config.demo_warmstart_success_only),
+        )
+        fit = self.warmstart_actor_from_demos(
+            observations=np.asarray(search.pop("observations"), dtype=float),
+            actions=np.asarray(search.pop("actions"), dtype=float),
+            epochs=int(self.config.demo_warmstart_epochs),
+            batch_size=int(self.config.demo_warmstart_batch_size),
+            actor_lr=float(self.config.demo_warmstart_actor_lr),
+        )
+        evaluation = self.evaluate(self.config.eval_episodes)
+        report = {
+            "search": search,
+            "fit": fit,
+            "evaluation": evaluation,
+        }
+        self._warmstart_report_path().write_text(json.dumps(_to_jsonable(report), indent=2), encoding="utf-8")
+        return report
+
     def run_episode(self, episode_index: int, training: bool = True) -> EpisodeSummary:
         stage_turns = self._select_stage_turns(episode_index) if training else float(self.config.target_turns)
         obs = self.env.reset(stage_turns=stage_turns, training=training)
@@ -413,7 +764,8 @@ class BarrelRollTrainer:
 
             next_obs, reward, done, info = self.env.step(action, step_index)
             if training:
-                buffer.add(obs, action, log_prob, reward, value, done)
+                # include info dict from environment for diagnostic correlation
+                buffer.add(obs, action, log_prob, reward, value, done, info)
             obs = next_obs
             episode_reward += reward
             # accumulate reward components if provided by env
@@ -520,11 +872,13 @@ class BarrelRollTrainer:
             "roll_progress",
             "roll_track",
             "roll_velocity",
+            "reverse_roll",
             "depth",
             "speed",
             "attitude",
             "stability",
             "action",
+            "terminal_progress",
             "episodic_penalty",
             "total",
         ]
@@ -594,7 +948,7 @@ class BarrelRollTrainer:
         print(f"  RL TRAINING - BARREL ROLL ({self.config.episodes} episodes)")
         print("=" * 64 + "\n")
 
-        best_reward = -float("inf")
+        best_score = (-float("inf"), -float("inf"), -float("inf"))
         episode_history: List[Dict[str, object]] = []
 
         for episode_index in range(self.config.episodes):
@@ -610,8 +964,9 @@ class BarrelRollTrainer:
             if (episode_index + 1) % self.config.save_every == 0:
                 self._save(self.latest_prefix)
 
-            if summary.reward > best_reward:
-                best_reward = summary.reward
+            summary_score = self._episode_score(summary)
+            if summary_score > best_score:
+                best_score = summary_score
                 self._save(self.best_prefix)
 
         self._save(self.latest_prefix)
@@ -625,7 +980,9 @@ class BarrelRollTrainer:
                 f"roll_turns_mean={evaluation['roll_turns_mean']:.3f}"
             )
 
-            if evaluation["reward_mean"] > best_reward:
+            evaluation_score = self._aggregate_score(evaluation)
+            if evaluation_score > best_score:
+                best_score = evaluation_score
                 self._save(self.best_prefix)
 
         report = {
@@ -698,7 +1055,8 @@ def run_phase(
         for step in range(config.episode_steps):
             action, log_prob, value = hrl.network.act(obs, update_obs_stats=True)
             next_obs, reward, done, info = hrl.env.step(action, step)
-            buffer.add(obs, action, log_prob, reward, value, done)
+            # include per-step info for diagnostics
+            buffer.add(obs, action, log_prob, reward, value, done, info)
 
             obs = next_obs
             episode_reward += float(reward)
@@ -808,24 +1166,59 @@ def _save_training_curves(hrl: BarrelRollTrainer, episode_history: List[Dict[str
     hrl._save_training_curves(episode_history, evaluation)
 
 
+def _checkpoint_score(metrics: Dict[str, float]) -> Tuple[float, float, float]:
+    return (
+        float(metrics.get("success_rate", 0.0)),
+        float(metrics.get("roll_turns_mean", 0.0)),
+        float(metrics.get("reward_mean", 0.0)),
+    )
+
+
 def parse_args() -> Tuple[BarrelRollConfig, bool]:
     parser = argparse.ArgumentParser(description="USV barrel roll RL training")
     parser.add_argument("--phases", nargs="*", type=int, default=[1, 2, 3])
     parser.add_argument("--cycles", type=int, default=1,
                         help="Quantas vezes repetir o bloco completo de fases.")
-    parser.add_argument("--phase-steps", type=int, default=4096)
-    parser.add_argument("--episodes", type=int, default=300)
+    parser.add_argument("--phase-steps", type=int, default=8192)
+    parser.add_argument("--episodes", type=int, default=600)
     parser.add_argument("--episode-steps", type=int, default=320)
     parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target-depth", type=float, default=5.0)
     parser.add_argument("--target-speed", type=float, default=0.8)
     parser.add_argument("--target-turns", type=float, default=1.0)
-    parser.add_argument("--max-thruster-force", type=float, default=12.0)
+    parser.add_argument("--max-thruster-force", type=float, default=60.0)
+    parser.add_argument(
+        "--action-layout",
+        type=str,
+        default="per_thruster",
+        choices=["paired", "per_thruster"],
+        help="Control parameterization for Barrel Roll training",
+    )
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/barrel_roll")
     parser.add_argument("--output-dir", type=str, default="./training_runs")
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--eval-episodes", type=int, default=8)
+    parser.add_argument("--demo-warmstart-rollouts", type=int, default=0, help="Random piecewise-constant rollouts to mine for imitation warmstart")
+    parser.add_argument("--demo-warmstart-segments", type=int, default=4, help="Number of constant-action segments per demo rollout")
+    parser.add_argument("--demo-warmstart-top-k", type=int, default=4, help="Number of top demo rollouts used for behavior cloning")
+    parser.add_argument("--demo-warmstart-epochs", type=int, default=24, help="Behavior cloning epochs for actor warmstart")
+    parser.add_argument("--demo-warmstart-batch-size", type=int, default=64, help="Behavior cloning batch size")
+    parser.add_argument("--demo-warmstart-actor-lr", type=float, default=1e-3, help="Behavior cloning learning rate for actor warmstart")
+    parser.add_argument("--demo-warmstart-allow-failures", action="store_true", help="Allow top non-success demos when no success rollouts are found")
+    parser.add_argument("--lr", type=float, default=0.0003, help="Learning rate for PPO updater")
+    parser.add_argument("--value-lr", type=float, default=None, help="Separate learning rate for value updates (optional)")
+    parser.add_argument("--value-clip", type=float, default=50.0, help="Clip critic values before value loss (<=0 disables)")
+    parser.add_argument("--roll-progress-weight", type=float, default=None, help="Override roll_progress_weight in config")
+    parser.add_argument("--roll-track-weight", type=float, default=None, help="Override roll_track_weight in config")
+    parser.add_argument("--roll-velocity-weight", type=float, default=None, help="Override roll_velocity_weight in config")
+    parser.add_argument("--reward-clip", type=float, default=0.0, help="Clip per-step reward to +-value (0 = disabled)")
+    parser.add_argument("--reward-scale", type=float, default=1.0, help="Scale per-step reward by this factor")
+    parser.add_argument("--reverse-roll-penalty-weight", type=float, default=None, help="Penalty weight for reverse roll progress")
+    parser.add_argument("--terminal-progress-weight", type=float, default=None, help="Terminal penalty weight for incomplete rolls")
+    parser.add_argument("--completion-bonus", type=float, default=None, help="Override completion bonus reward")
+    parser.add_argument("--episodic-penalty-mult", type=float, default=None, help="Multiplier for episodic insufficient-roll penalty")
+    parser.add_argument("--required-min-roll", type=float, default=None, help="Fraction of target roll required to avoid episodic penalty (0-1)")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
     args = parser.parse_args()
@@ -842,12 +1235,45 @@ def parse_args() -> Tuple[BarrelRollConfig, bool]:
         target_speed=args.target_speed,
         target_turns=args.target_turns,
         max_thruster_force=args.max_thruster_force,
+        action_layout=args.action_layout,
+        lr=args.lr,
+        value_lr=args.value_lr,
+        value_clip=args.value_clip,
+        reward_clip=args.reward_clip,
+        reward_scale=args.reward_scale,
         checkpoint_dir=args.checkpoint_dir,
         output_dir=args.output_dir,
         save_every=args.save_every,
         eval_episodes=args.eval_episodes,
         fresh=args.fresh,
+        demo_warmstart_rollouts=args.demo_warmstart_rollouts,
+        demo_warmstart_segments=args.demo_warmstart_segments,
+        demo_warmstart_top_k=args.demo_warmstart_top_k,
+        demo_warmstart_epochs=args.demo_warmstart_epochs,
+        demo_warmstart_batch_size=args.demo_warmstart_batch_size,
+        demo_warmstart_actor_lr=args.demo_warmstart_actor_lr,
+        demo_warmstart_success_only=not bool(args.demo_warmstart_allow_failures),
     )
+    # apply optional CLI overrides for reward weights if provided
+    if getattr(args, 'roll_progress_weight', None) is not None:
+        config.roll_progress_weight = float(args.roll_progress_weight)
+    if getattr(args, 'roll_track_weight', None) is not None:
+        config.roll_track_weight = float(args.roll_track_weight)
+    if getattr(args, 'roll_velocity_weight', None) is not None:
+        config.roll_velocity_weight = float(args.roll_velocity_weight)
+    # apply scale/clip
+    config.reward_clip = float(args.reward_clip)
+    config.reward_scale = float(args.reward_scale)
+    if getattr(args, "reverse_roll_penalty_weight", None) is not None:
+        config.reverse_roll_penalty_weight = float(args.reverse_roll_penalty_weight)
+    if getattr(args, "terminal_progress_weight", None) is not None:
+        config.terminal_progress_weight = float(args.terminal_progress_weight)
+    if getattr(args, 'completion_bonus', None) is not None:
+        config.completion_bonus = float(args.completion_bonus)
+    if getattr(args, 'episodic_penalty_mult', None) is not None:
+        config.episodic_penalty_mult = float(args.episodic_penalty_mult)
+    if getattr(args, 'required_min_roll', None) is not None:
+        config.required_min_roll = float(args.required_min_roll)
     return config, args.no_eval
 
 
@@ -861,13 +1287,24 @@ def main() -> int:
     geometry, physics, env, network, updater, trainer = build_stack(config)
     if not config.fresh:
         trainer._load_if_requested()
+    elif int(getattr(config, "demo_warmstart_rollouts", 0)) > 0:
+        warmstart = trainer.demo_warmstart()
+        search = warmstart.get("search", {})
+        evaluation = warmstart.get("evaluation", {})
+        print(
+            "Warmstart | "
+            f"success_demos={search.get('selected_success_count', 0)}/{search.get('selected_count', 0)} | "
+            f"best_demo_roll={search.get('best_roll_turns', 0.0):.3f} | "
+            f"eval_success={evaluation.get('success_rate', 0.0):.2f} | "
+            f"eval_roll={evaluation.get('roll_turns_mean', 0.0):.3f}"
+        )
 
     report = {
         "config": asdict(config),
         "phases": [],
     }
     episode_history: List[Dict[str, object]] = []
-    best_phase_reward = -float("inf")
+    best_phase_score = (-float("inf"), -float("inf"), -float("inf"))
 
     for cycle_idx in range(config.cycles):
         print(f"\n=== Training cycle {cycle_idx + 1}/{config.cycles} ===")
@@ -880,11 +1317,14 @@ def main() -> int:
             episode_history.extend(phase_history)
             print(
                 f"Cycle {cycle_idx + 1} | Phase {phase} complete: "
-                f"{summary['steps']} steps | reward_mean={summary['reward_mean']:.3f}"
+                f"{summary['steps']} steps | reward_mean={summary['reward_mean']:.3f} | "
+                f"roll_turns_mean={summary['roll_turns_mean']:.3f} | "
+                f"success_rate={summary['success_rate']:.3f}"
             )
 
-            if summary["reward_mean"] > best_phase_reward:
-                best_phase_reward = summary["reward_mean"]
+            summary_score = _checkpoint_score(summary)
+            if summary_score > best_phase_score:
+                best_phase_score = summary_score
                 trainer._save(trainer.best_prefix)
 
     evaluation = None
@@ -893,9 +1333,12 @@ def main() -> int:
         report["evaluation"] = evaluation
         print(
             f"Evaluation: success_rate={evaluation['success_rate']:.2f}, "
-            f"reward_mean={evaluation['reward_mean']:.3f}"
+            f"reward_mean={evaluation['reward_mean']:.3f}, "
+            f"roll_turns_mean={evaluation['roll_turns_mean']:.3f}"
         )
-        if evaluation["reward_mean"] > best_phase_reward:
+        evaluation_score = _checkpoint_score(evaluation)
+        if evaluation_score > best_phase_score:
+            best_phase_score = evaluation_score
             trainer._save(trainer.best_prefix)
 
     report_path = Path(config.output_dir) / "barrel_roll_training_report.json"

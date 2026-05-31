@@ -317,19 +317,76 @@ class PhysicsEngine:
             base_mass=self._rigid_body_mass,
             sim_speed_multiplier=sim_speed_multiplier,
         )
-        # Dois thrusters laterais na altura do CG para recuperar autoridade
-        # de roll/yaw sem deslocar longitudinalmente o thrust do centro de massa.
+        # Two-side thruster setup by default. If a vehicle_profile provides
+        # multiple thruster site names (e.g. MJCF with 8 actuators), create
+        # a list of Thruster objects and map incoming two-channel commands
+        # into the multi-thruster layout by splitting power across port/starboard
+        # groups. Keep `thruster_port` and `thruster_starboard` attributes for
+        # backward compatibility (they point to a representative thruster).
         lateral_arm = max(0.03, 0.4 * self.hull.R)
-        port_position = np.array([0.0, +lateral_arm, 0.0], dtype=float) if thruster_port_position is None else np.asarray(thruster_port_position, dtype=float)
-        starboard_position = np.array([0.0, -lateral_arm, 0.0], dtype=float) if thruster_starboard_position is None else np.asarray(thruster_starboard_position, dtype=float)
-        self.thruster_port = Thruster(
-            max_force=max_thruster_force,
-            position_body=port_position,
-        )
-        self.thruster_starboard = Thruster(
-            max_force=max_thruster_force,
-            position_body=starboard_position,
-        )
+        default_port = np.array([0.0, +lateral_arm, 0.0], dtype=float)
+        default_star = np.array([0.0, -lateral_arm, 0.0], dtype=float)
+
+        # If a vehicle_profile provided explicit per-side positions, use them
+        port_pos = np.asarray(thruster_port_position, dtype=float) if thruster_port_position is not None else default_port
+        star_pos = np.asarray(thruster_starboard_position, dtype=float) if thruster_starboard_position is not None else default_star
+
+        # create thrusters list (may be replaced by mapping below)
+        self.thrusters = []
+
+        # If vehicle_profile has metadata listing thruster sites, expand to that many
+        try:
+            sites = getattr(vehicle_profile, 'metadata', {}).get('thruster', {}).get('site_names', None) if vehicle_profile is not None else None
+            if sites and isinstance(sites, (list, tuple)) and len(sites) > 0:
+                # attempt to load explicit mapping file first (created by tools/map_thruster_sites.py)
+                import json, os
+                repo_root = os.path.dirname(os.path.abspath(__file__))
+                mapping_path = os.path.join(repo_root, 'training_runs', f'thruster_mapping_{getattr(vehicle_profile, "name", "profile").lower()}.json')
+                mapping = None
+                try:
+                    if os.path.exists(mapping_path):
+                        with open(mapping_path, 'r') as fh:
+                            mapping = json.load(fh).get('sites', None)
+                except Exception:
+                    mapping = None
+
+                if mapping and isinstance(mapping, list) and len(mapping) >= len(sites):
+                    # mapping may contain extra non-thruster sites (e.g. taluy_site).
+                    # Build a dict by site_name for quick lookup and then order
+                    # according to the declared `sites` in vehicle_profile.
+                    mapping_by_name = {ent.get('site_name'): ent for ent in mapping if isinstance(ent, dict) and ent.get('site_name')}
+                    all_present = all(name in mapping_by_name for name in sites)
+                    if all_present:
+                        self.thrusters = []
+                        for name in sites:
+                            ent = mapping_by_name.get(name)
+                            pos = ent.get('position_body_m', None) if ent is not None else None
+                            if pos is None:
+                                pos = port_pos
+                            self.thrusters.append(Thruster(max_force=max_thruster_force, position_body=np.asarray(pos, dtype=float)))
+                    else:
+                        # fallback to building from declared sites by alternating
+                        self.thrusters = []
+                        for i, name in enumerate(sites):
+                            side_pos = port_pos if (i % 2 == 0) else star_pos
+                            self.thrusters.append(Thruster(max_force=max_thruster_force, position_body=side_pos))
+                else:
+                    # build thrusters from the declared sites by alternating side positions
+                    self.thrusters = []
+                    for i, name in enumerate(sites):
+                        side_pos = port_pos if (i % 2 == 0) else star_pos
+                        self.thrusters.append(Thruster(max_force=max_thruster_force, position_body=side_pos))
+        except Exception:
+            # on any error, fall back to the two-thruster layout
+            pass
+
+        # Representative attributes for compatibility (ensure at least two)
+        if len(self.thrusters) == 0:
+            # fallback to two default thrusters
+            self.thrusters.append(Thruster(max_force=max_thruster_force, position_body=port_pos))
+            self.thrusters.append(Thruster(max_force=max_thruster_force, position_body=star_pos))
+        self.thruster_port = self.thrusters[0]
+        self.thruster_starboard = self.thrusters[1]
 
         self._state = VehicleState()
         self._time  = 0.0
@@ -484,10 +541,31 @@ class PhysicsEngine:
             t2 = float(thruster2_theta if thruster2_theta is not None else thruster_theta)
             f2 = float(thruster2_phi if thruster2_phi is not None else thruster_phi)
 
-        self.thruster_port.set_orientation(t1, f1)
-        self.thruster_port.set_power(p1)
-        self.thruster_starboard.set_orientation(t2, f2)
-        self.thruster_starboard.set_power(p2)
+        # If multiple thrusters exist, distribute p1 across port-side thrusters
+        # and p2 across starboard-side thrusters. Decision which thruster is
+        # port/starboard is based on the sign of y in `position_body`.
+        port_indices = [i for i, th in enumerate(self.thrusters) if float(th.position_body[1]) > 0.0]
+        star_indices = [i for i, th in enumerate(self.thrusters) if float(th.position_body[1]) <= 0.0]
+
+        # fallback to first two if detection fails
+        if not port_indices:
+            port_indices = [0]
+        if not star_indices:
+            star_indices = [1 if len(self.thrusters) > 1 else 0]
+
+        p_port_share = p1 / float(len(port_indices))
+        p_star_share = p2 / float(len(star_indices))
+
+        for i, th in enumerate(self.thrusters):
+            if i in port_indices:
+                th.set_orientation(t1, f1)
+                th.set_power(p_port_share)
+            else:
+                th.set_orientation(t2, f2)
+                th.set_power(p_star_share)
+        # maintain compatibility attributes
+        self.thruster_port = self.thrusters[port_indices[0]]
+        self.thruster_starboard = self.thrusters[star_indices[0]]
         self.ballast.update(ballast_cmd, dt)
 
         # recalcula massa adicionada com lastro atualizado
@@ -725,7 +803,10 @@ class PhysicsEngine:
 
         D   = self._drag_matrix(nu_for_drag)
         g   = self._restoring_forces(eta)
-        tau = self.thruster_port.wrench_body + self.thruster_starboard.wrench_body
+        # Sum wrench from all thrusters (works for 2 or N thrusters).
+        tau = np.zeros(6, dtype=float)
+        for th in self.thrusters:
+            tau = tau + th.wrench_body
 
         # aumenta efeito do arrasto com turbulência
         if self._env_turbulence > 0.0:

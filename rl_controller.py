@@ -31,6 +31,8 @@ Referências:
 import numpy as np
 import os
 import pickle
+import json
+import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from collections import deque
@@ -209,6 +211,7 @@ class ActorCritic:
         obs_dim:    int,
         action_dim: int,
         hidden:     List[int] = None,
+        value_scale: Optional[float] = None,
     ):
         self.obs_dim    = obs_dim
         self.action_dim = action_dim
@@ -231,6 +234,8 @@ class ActorCritic:
         self._obs_mean  = np.zeros(obs_dim)
         self._obs_var   = np.ones(obs_dim)
         self._obs_count = 1e-4
+        # optional scale to bound critic outputs (value = tanh(raw) * value_scale)
+        self.value_scale = float(value_scale) if value_scale is not None else None
 
     def normalize_obs(self, obs: np.ndarray, update_stats: bool = True) -> np.ndarray:
         """Normalização de observações usando running mean/std."""
@@ -265,7 +270,11 @@ class ActorCritic:
 
         h     = self.backbone.forward(obs)
         mean  = np.tanh(self.actor_head.forward(h))   # tanh → bounded actions
-        value = self.critic_head.forward(h)
+        value_raw = self.critic_head.forward(h)
+        if self.value_scale is not None:
+            value = np.tanh(value_raw) * self.value_scale
+        else:
+            value = value_raw
 
         std   = np.exp(np.clip(self.log_std.data, -4, 2))
 
@@ -305,7 +314,11 @@ class ActorCritic:
 
         h      = self.backbone.forward(obs)
         mean   = np.tanh(self.actor_head.forward(h))
-        values = self.critic_head.forward(h)[:, 0]
+        values_raw = self.critic_head.forward(h)[:, 0]
+        if self.value_scale is not None:
+            values = np.tanh(values_raw) * self.value_scale
+        else:
+            values = values_raw
         std    = np.exp(np.clip(self.log_std.data, -4, 2))
 
         log_probs = self._gaussian_log_prob(actions, mean, std)
@@ -384,6 +397,7 @@ class RolloutBuffer:
     rewards:      List[float]      = field(default_factory=list)
     values:       List[float]      = field(default_factory=list)
     dones:        List[bool]       = field(default_factory=list)
+    infos:         List[dict]      = field(default_factory=list)
 
     def add(
         self,
@@ -393,6 +407,7 @@ class RolloutBuffer:
         reward:   float,
         value:    float,
         done:     bool,
+        info:     Optional[dict] = None,
     ):
         self.observations.append(obs.copy())
         self.actions.append(action.copy())
@@ -400,6 +415,7 @@ class RolloutBuffer:
         self.rewards.append(reward)
         self.values.append(value)
         self.dones.append(done)
+        self.infos.append(dict(info) if info is not None else {})
 
     def compute_returns_and_advantages(
         self,
@@ -428,6 +444,8 @@ class RolloutBuffer:
 
         # normaliza vantagens
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # normaliza returns para reduzir magnitude dos alvos do crítico
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         return returns, advantages
 
     def get_batches(
@@ -484,6 +502,8 @@ class PPOUpdater:
         value_coef:   float = 0.5,
         n_epochs:    int   = 10,
         batch_size:  int   = 64,
+        value_lr:    float = None,
+        value_clip:  float = 50.0,
     ):
         self.net          = network
         self.clip_eps     = clip_eps
@@ -492,6 +512,13 @@ class PPOUpdater:
         self.n_epochs     = n_epochs
         self.batch_size   = batch_size
         self.optimizer    = Adam(network.parameters(), lr=lr)
+        # optional separate learning rate for value-related gradients: implemented
+        # by scaling critic parameter gradients before optimizer step
+        self.value_lr = float(value_lr) if value_lr is not None else None
+        self.value_clip = float(value_clip) if value_clip is not None and float(value_clip) > 0.0 else None
+        self._diag_count = 0
+        # threshold to dump diagnostic rollout when value_loss is large
+        self.value_diag_threshold = 9.0
 
         self._losses = deque(maxlen=100)
 
@@ -512,6 +539,9 @@ class PPOUpdater:
 
                 # avalia política atual no batch
                 log_probs, values, entropy = self.net.evaluate(obs_b, act_b)
+                values_for_loss = values
+                if self.value_clip is not None:
+                    values_for_loss = np.clip(values, -self.value_clip, self.value_clip)
 
                 # ratio PPO: π_new / π_old
                 ratio = np.exp(log_probs - old_lp_b)
@@ -521,8 +551,11 @@ class PPOUpdater:
                 surr2 = np.clip(ratio, 1-self.clip_eps, 1+self.clip_eps) * adv_b
                 policy_loss = -np.minimum(surr1, surr2).mean()
 
+                # optionally clip returns to limit critic targets when value_clip is set
+                if self.value_clip is not None:
+                    ret_b = np.clip(ret_b, -self.value_clip, self.value_clip)
                 # value function loss
-                value_loss = 0.5 * ((values - ret_b)**2).mean()
+                value_loss = 0.5 * ((values_for_loss - ret_b)**2).mean()
 
                 # total loss
                 loss = (policy_loss +
@@ -533,8 +566,51 @@ class PPOUpdater:
                 self.net.zero_grad()
                 self._backward(
                     obs_b, act_b, old_lp_b, ret_b, adv_b,
-                    log_probs, values, ratio
+                    log_probs, values_for_loss, ratio
                 )
+                # if requested, scale critic gradients to effectively use a
+                # different value learning rate (keeps single Adam optimizer
+                # while allowing smaller/larger critic updates)
+                if self.value_lr is not None:
+                    try:
+                        scale = float(self.value_lr) / float(self.optimizer.lr)
+                    except Exception:
+                        scale = 1.0
+                    # scale gradients of critic head parameters only
+                    for p in self.net.critic_head.parameters():
+                        p.grad *= scale
+
+                # write diagnostic snapshot when value loss spikes above threshold
+                if float(value_loss) > float(self.value_diag_threshold):
+                    # try to include the full rollout buffer contents if available
+                    diag = {
+                        'timestamp': time.time(),
+                        'value_loss': float(value_loss),
+                        'values': values.tolist(),
+                        'values_clipped': values_for_loss.tolist(),
+                        'returns': ret_b.tolist(),
+                        'advantages': adv_b.tolist(),
+                        'batch_size': int(len(ret_b)),
+                    }
+                    try:
+                        # if buffer object is accessible via closure, include it
+                        diag['buffer_observations'] = [o.tolist() for o in buffer.observations]
+                        diag['buffer_actions'] = [a.tolist() for a in buffer.actions]
+                        diag['buffer_log_probs'] = [float(lp) for lp in buffer.log_probs]
+                        diag['buffer_rewards'] = [float(r) for r in buffer.rewards]
+                        diag['buffer_values'] = [float(v) for v in buffer.values]
+                        diag['buffer_dones'] = [bool(d) for d in buffer.dones]
+                        diag['buffer_infos'] = buffer.infos
+                    except Exception:
+                        pass
+
+                    diag_dir = os.path.join('training_runs', 'diagnostics')
+                    os.makedirs(diag_dir, exist_ok=True)
+                    fname = os.path.join(diag_dir, f'value_spike_{int(time.time())}_{self._diag_count}.json')
+                    with open(fname, 'w', encoding='utf-8') as df:
+                        json.dump(diag, df, indent=2)
+                    self._diag_count += 1
+
                 self.optimizer.step(max_grad_norm=0.5)
                 self.optimizer.zero_grad()
 
@@ -578,12 +654,12 @@ class PPOUpdater:
         grad_ratio = np.where(clipped, 0.0, -advantages) / B
         grad_log_prob = grad_ratio * ratio   # chain rule: d/d(log_π) = ratio * d/d(ratio)
 
-        # backprop pelo critic head
+        # backprop pelo critic head (retorna grad para o backbone)
         grad_critic = grad_value[:, np.newaxis]
         h = self.net.backbone.forward(obs)
-        self.net.critic_head.backward(grad_critic)
+        grad_backbone_from_critic = self.net.critic_head.backward(grad_critic)
 
-        # backprop pelo actor head
+        # backprop pelo actor head (retorna grad para o backbone)
         # log_prob = Σ [-0.5 * ((a - μ)/σ)² - log(σ) - 0.5*log(2π)]
         mean = np.tanh(self.net.actor_head.forward(h))
         std  = np.exp(np.clip(self.net.log_std.data, -4, 2))
@@ -594,7 +670,7 @@ class PPOUpdater:
 
         # d(tanh)/d(pre_tanh) = 1 - tanh²
         grad_pre_tanh = grad_mean * (1 - mean**2)
-        self.net.actor_head.backward(grad_pre_tanh)
+        grad_backbone_from_actor = self.net.actor_head.backward(grad_pre_tanh)
 
         # gradiente de log_std
         d_log_prob_d_log_std = ((actions - mean)**2 / (std**2 + 1e-8) - 1)
@@ -602,11 +678,9 @@ class PPOUpdater:
             grad_log_prob[:, np.newaxis] * d_log_prob_d_log_std
         ).mean(axis=0)
 
-        # backprop pelo backbone (soma dos gradientes de actor e critic)
-        grad_backbone_from_critic = self.net.critic_head.layers[0].backward(
-            grad_critic
-        ) if hasattr(self.net.critic_head, '_last_backward') else np.zeros_like(h)
-        self.net.backbone.backward(grad_pre_tanh @ self.net.actor_head.layers[0].W.data)
+        # backprop pelo backbone somando contribuições do ator e do crítico
+        total_grad_backbone = grad_backbone_from_actor + grad_backbone_from_critic
+        self.net.backbone.backward(total_grad_backbone)
 
     @property
     def mean_loss(self) -> float:
@@ -698,13 +772,13 @@ class N1Agent:
     OBS_DIM    = 9    # accel(3) + gyro(3) + orientation(3)
     ACTION_DIM = 4    # thruster_power, theta, phi, ballast
 
-    def __init__(self, lr: float = 3e-4):
+    def __init__(self, lr: float = 3e-4, value_lr: float = None):
         self.network = ActorCritic(
             obs_dim=self.OBS_DIM,
             action_dim=self.ACTION_DIM,
             hidden=[64, 64],
         )
-        self.updater = PPOUpdater(self.network, lr=lr)
+        self.updater = PPOUpdater(self.network, lr=lr, value_lr=value_lr)
         self.buffer  = RolloutBuffer(capacity=2048)
         self.frozen  = False
 
@@ -771,13 +845,13 @@ class N2Agent:
     OBS_DIM    = 13   # sonar(6) + n1_action(4) + position(3)
     ACTION_DIM = 9    # setpoint pra N1: accel_ref(3) + gyro_ref(3) + orientation_ref(3)
 
-    def __init__(self, lr: float = 3e-4):
+    def __init__(self, lr: float = 3e-4, value_lr: float = None):
         self.network = ActorCritic(
             obs_dim=self.OBS_DIM,
             action_dim=self.ACTION_DIM,
             hidden=[128, 64],
         )
-        self.updater = PPOUpdater(self.network, lr=lr)
+        self.updater = PPOUpdater(self.network, lr=lr, value_lr=value_lr)
         self.buffer  = RolloutBuffer(capacity=2048)
         self.frozen  = False
 
@@ -823,13 +897,13 @@ class N3Agent:
     OBS_DIM       = 12 + MAX_WAYPOINTS * 3 + 3   # ekf_state(12) + waypoints(15) + vision(3)
     ACTION_DIM    = 13                         # setpoint pra N2
 
-    def __init__(self, lr: float = 3e-4):
+    def __init__(self, lr: float = 3e-4, value_lr: float = None):
         self.network = ActorCritic(
             obs_dim=self.OBS_DIM,
             action_dim=self.ACTION_DIM,
             hidden=[128, 128],
         )
-        self.updater  = PPOUpdater(self.network, lr=lr)
+        self.updater  = PPOUpdater(self.network, lr=lr, value_lr=value_lr)
         self.buffer   = RolloutBuffer(capacity=1024)   # menor — decisões mais lentas
         self.frozen   = False
         self.waypoints: List[np.ndarray] = []

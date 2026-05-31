@@ -27,13 +27,16 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 from collections import deque
 from enum import Enum
+import time
 
 from geometry_engine import GeometryEngine
 from physics_engine  import PhysicsEngine, ComponentMasses
 from sensor_engine   import SensorEngine, ExtendedKalmanFilter, Environment, Obstacle
-from control_engine  import ControlEngine
+from control_engine  import ControlEngine, ManualCommandSource
 from mpc_controller  import integrate_mpc
 from rl_controller   import HRLController, integrate_rl
+from hil_interface   import HILProtocol
+from manual_control_sources import build_manual_source
 
 
 EARTH_RADIUS_M = 6378137.0
@@ -335,6 +338,14 @@ class MissionEngine:
         seed:           int   = 42,
         pool_depth:     float = 5.0,
         pool_radius:    float = 20.0,
+        hil_bridge:     object = None,
+        mixer:          object = None,
+        telemetry_broadcaster: object = None,
+        hil_orchestrator: object = None,
+        control_mode:   str   = 'autonomous',
+        manual_command_source: Optional[ManualCommandSource] = None,
+        manual_source_mode: Optional[str] = None,
+        manual_source_config: Optional[Dict[str, object]] = None,
     ):
         self.geo            = geometry
         self.checkpoint_dir = checkpoint_dir
@@ -348,6 +359,21 @@ class MissionEngine:
         self.sensors  = SensorEngine(self.env, noise_scale=0.0, seed=seed)
         self.ekf      = ExtendedKalmanFilter(self.physics)
         self.control  = ControlEngine(self.physics, hover_depth=pool_depth/2)
+        self.control_mode = str(control_mode or 'autonomous').lower()
+        self._manual_mode = self.control_mode == 'manual'
+        self._manual_source_mode = manual_source_mode
+        self._manual_source_config = dict(manual_source_config or {})
+
+        if manual_command_source is None and manual_source_mode is not None:
+            manual_command_source = build_manual_source(
+                manual_source_mode,
+                self._manual_source_config,
+            )
+
+        if manual_command_source is not None:
+            self.control.set_manual_source(manual_command_source)
+        if self._manual_mode:
+            self.control.set_controller('manual')
 
         # integra controladores
         integrate_mpc(self.control, hover_depth=pool_depth/2)
@@ -357,6 +383,20 @@ class MissionEngine:
         self.ep_gen    = EpisodeGenerator(self.rng)
         self.randomizer = DomainRandomizer(self.rng)
         self.dynamic_obstacles: List[DynamicObstacle] = []
+        self.hil_bridge = hil_bridge
+        self.mixer = mixer
+        self.telemetry_broadcaster = telemetry_broadcaster
+        self.hil_orchestrator = hil_orchestrator
+        # HIL watchdog / safety
+        self.hil_watchdog_timeout_s = 0.5
+        self.hil_watchdog_max_missed = 5
+        self._hil_last_ack_time: Optional[float] = None
+        self._hil_missed_acks: int = 0
+        self._hil_in_safe_mode: bool = False
+        self.hil_jitter_ms = 0.0
+        # legacy compatibility
+        self.hil_jitter_mean_s = 0.0
+        self.hil_jitter_std_s = 0.0
 
         # referência global local (NED) para waypoints especificados manualmente
         self._fixed_waypoints: Optional[List[np.ndarray]] = None
@@ -429,7 +469,8 @@ class MissionEngine:
     ) -> EpisodeResult:
         """Roda episódio em modo inferência pura — sem treinamento."""
         self.hrl.set_phase(0)
-        self.hrl.set_waypoints(waypoints)
+        if not self._manual_mode:
+            self.hrl.set_waypoints(waypoints)
         return self._run_episode(dt=dt, training=False, max_steps=max_steps)
 
     def set_waypoints_local(self, waypoints_ned: List[np.ndarray]) -> None:
@@ -474,6 +515,89 @@ class MissionEngine:
             waypoints_ned.append(np.array([north, east, down], dtype=float))
 
         self.set_waypoints_local(waypoints_ned)
+
+    def _sample_hil_jitter(self) -> float:
+        # prefer new ms-based jitter, fall back to legacy mean/std (seconds)
+        if getattr(self, 'hil_jitter_ms', 0.0) > 0.0:
+            jitter = float(self.rng.normal(0.0, float(getattr(self, 'hil_jitter_ms', 0.0)))) / 1000.0
+            return max(0.0, jitter)
+        if getattr(self, 'hil_jitter_mean_s', 0.0) > 0.0 or getattr(self, 'hil_jitter_std_s', 0.0) > 0.0:
+            mean = float(getattr(self, 'hil_jitter_mean_s', 0.0))
+            std = float(getattr(self, 'hil_jitter_std_s', 0.0))
+            jitter = float(self.rng.normal(mean, max(1e-6, std)))
+            return max(0.0, jitter)
+        return 0.0
+
+    def _build_telemetry_frame(
+        self,
+        cmd,
+        bundle,
+        est,
+        sensors_reply,
+        latency_s: float,
+        step: int,
+        termination: EpisodeTermination,
+    ) -> Dict[str, object]:
+        """Consolida um frame de telemetria para dashboards e logging."""
+        def _jsonable(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, (np.floating, np.integer)):
+                return value.item()
+            return value
+
+        sensor_fault_profile = {}
+        fp = getattr(self.sensors, 'fault_profile', None)
+        if fp is not None:
+            sensor_fault_profile = {key: _jsonable(value) for key, value in fp.__dict__.items()}
+
+        thruster_faults = {}
+        if getattr(self.mixer, 'fault_profiles', None) is not None:
+            thruster_faults = {
+                name: {key: _jsonable(value) for key, value in fault.__dict__.items()}
+                for name, fault in self.mixer.fault_profiles.items()
+            }
+
+        return {
+            'timestamp': time.time(),
+            'step': step,
+            'termination': termination.value,
+            'state': {
+                'x': float(self.physics.state.x),
+                'y': float(self.physics.state.y),
+                'z': float(self.physics.state.z),
+                'phi': float(self.physics.state.phi),
+                'theta': float(self.physics.state.tht),
+                'psi': float(self.physics.state.psi),
+            },
+            'ekf': est.to_dict() if hasattr(est, 'to_dict') else {},
+            'imu': bundle.imu.to_dict(),
+            'barometer': {
+                'depth': float(bundle.barometer.depth),
+                'pressure': float(bundle.barometer.pressure),
+            },
+            'sonar': [s.to_dict() for s in bundle.sonar],
+            'control': {
+                'thruster_power': float(getattr(cmd, 'thruster_power', 0.0)),
+                'thruster2_power': float(getattr(cmd, 'thruster2_power', 0.0)),
+                'thruster_theta': float(getattr(cmd, 'thruster_theta', 0.0)),
+                'thruster_phi': float(getattr(cmd, 'thruster_phi', 0.0)),
+                'ballast_cmd': float(getattr(cmd, 'ballast_cmd', 0.0)),
+            },
+            'hil': {
+                'bridge': type(self.hil_bridge).__name__ if self.hil_bridge is not None else None,
+                'safe_mode': bool(self._hil_in_safe_mode),
+                'last_ack_time': self._hil_last_ack_time,
+                'missed_acks': self._hil_missed_acks,
+                'latency_s': float(latency_s),
+                'reply_present': bool(sensors_reply),
+            },
+            'faults': {
+                'sensor_fault_profile': sensor_fault_profile,
+                'thruster_faults': thruster_faults,
+            },
+            'multiple_devices': self.hil_orchestrator.snapshot() if hasattr(self.hil_orchestrator, 'snapshot') else {},
+        }
 
     # ─── Loop de episódio ────────────────────
 
@@ -531,6 +655,8 @@ class MissionEngine:
         termination = EpisodeTermination.RUNNING
         last_cmd   = None
         mpc_counter = 0
+        sensors_reply = None
+        latency = 0.0
 
         # ── Loop do episódio ──────────────────
         while step < max_s and termination == EpisodeTermination.RUNNING:
@@ -542,7 +668,18 @@ class MissionEngine:
                 self._update_dynamic_obstacles()
 
             # sensoriamento
-            bundle = self.sensors.read(self.physics.state, self.physics.time)
+            bundle = None
+            # if HIL bridge returned sensors earlier, prefer hardware frame
+            if 'sensors_reply' in locals() and sensors_reply:
+                try:
+                    hw_bundle = self.sensors.read_from_hardware(sensors_reply)
+                    if hw_bundle is not None:
+                        bundle = hw_bundle
+                except Exception:
+                    bundle = None
+
+            if bundle is None:
+                bundle = self.sensors.read(self.physics.state, self.physics.time)
 
             # EKF
             self.ekf.predict(dt)
@@ -552,23 +689,102 @@ class MissionEngine:
             est = self.ekf.state_estimate
 
             # ação HRL
-            cmd = self.hrl.compute(
-                ekf_state=est,
-                imu_reading=bundle.imu,
-                sonar_readings=bundle.sonar,
-                dt=dt,
-                training=training,
-            )
+            if self._manual_mode:
+                cmd = self.control.compute(est, self.physics.time)
+            else:
+                cmd = self.hrl.compute(
+                    ekf_state=est,
+                    imu_reading=bundle.imu,
+                    sonar_readings=bundle.sonar,
+                    dt=dt,
+                    training=training,
+                )
+
+            # HIL handshake (if bridge provided): send command, wait sensors/ack
+            if getattr(self, 'hil_bridge', None) is not None:
+                try:
+                    jitter_s = self._sample_hil_jitter()
+                    if jitter_s > 0.0:
+                        time.sleep(jitter_s)
+
+                    # default to JSON mode for readability; bridge may accept binary
+                    payload = HILProtocol.serialize_json_command(cmd)
+                    t_send = time.time()
+                    # send and block for emulated latency/ack
+                    # bridge API can be MockLoopbackBridge or UDPHILBridge
+                    sensors_reply = None
+                    # prefer send_command_with_ack when available (UDPHILBridge)
+                    if hasattr(self.hil_bridge, 'send_command_with_ack'):
+                        try:
+                            ok = self.hil_bridge.send_command_with_ack(payload, mode='json', ack_timeout=0.2)
+                        except Exception:
+                            ok = False
+                        # watchdog accounting
+                        if ok:
+                            self._hil_last_ack_time = time.time()
+                            self._hil_missed_acks = 0
+                        else:
+                            self._hil_missed_acks += 1
+                            if self._hil_missed_acks >= self.hil_watchdog_max_missed:
+                                self._hil_in_safe_mode = True
+                        # if ack received, attempt to read sensor reply
+                        if ok and hasattr(self.hil_bridge, 'recv_sensors'):
+                            if jitter_s > 0.0:
+                                time.sleep(jitter_s)
+                            sensors_reply = self.hil_bridge.recv_sensors(timeout=0.2)
+                    else:
+                        # fallback to older send/recv API
+                        if hasattr(self.hil_bridge, 'send_command'):
+                            try:
+                                self.hil_bridge.send_command(payload, mode='json')
+                            except TypeError:
+                                self.hil_bridge.send_command(payload)
+                        if hasattr(self.hil_bridge, 'recv_sensors'):
+                            sensors_reply = self.hil_bridge.recv_sensors(timeout=0.1)
+                        elif hasattr(self.hil_bridge, 'recv_sensor'):
+                            sensors_reply = self.hil_bridge.recv_sensor(timeout=0.1)
+                    t_recv = time.time()
+                    latency = (t_recv - t_send)
+                    # lightweight logging
+                    if (self._episode_count + step) % 100 == 0:
+                        print(f"[HIL] step={step} latency={latency*1000:.2f}ms reply={'OK' if sensors_reply else 'NONE'}")
+                except Exception as e:
+                    print(f"[HIL] bridge error: {e}")
 
             # física
             env_cur, env_turb = self.sensors.get_environmental_state()
             env_harm = self.sensors.get_environmental_harmonics()
+
+            # use mixer (if provided) to map abstract command to thruster powers
+            # if HIL in safe mode, zero actuators
+            if getattr(self, '_hil_in_safe_mode', False):
+                thr_p = 0.0
+                thr_p2 = 0.0
+                thr_theta = 0.0
+                thr_phi = 0.0
+            else:
+                thr_p = cmd.thruster_power
+                thr_p2 = cmd.thruster2_power
+                thr_theta = cmd.thruster_theta
+                thr_phi = cmd.thruster_phi
+
+            if getattr(self, 'mixer', None) is not None:
+                try:
+                    allocated = self.mixer.allocate(thr_p, thr_p2)
+                    if isinstance(allocated, (list, tuple)) and len(allocated) >= 1:
+                        thr_p = allocated[0]
+                    if isinstance(allocated, (list, tuple)) and len(allocated) >= 2:
+                        thr_p2 = allocated[1]
+                except Exception:
+                    # fallback to direct command on error
+                    pass
+
             self.physics.step(
-                thruster_power=cmd.thruster_power,
-                thruster_theta=cmd.thruster_theta,
-                thruster_phi=cmd.thruster_phi,
+                thruster_power=thr_p,
+                thruster_theta=thr_theta,
+                thruster_phi=thr_phi,
                 ballast_cmd=cmd.ballast_cmd,
-                thruster2_power=cmd.thruster2_power,
+                thruster2_power=thr_p2,
                 thruster2_theta=cmd.thruster2_theta,
                 thruster2_phi=cmd.thruster2_phi,
                 dt=dt,
@@ -576,6 +792,21 @@ class MissionEngine:
                 env_turbulence=env_turb,
                 env_harmonics=env_harm,
             )
+
+            if getattr(self, 'telemetry_broadcaster', None) is not None:
+                try:
+                    frame = self._build_telemetry_frame(
+                        cmd=cmd,
+                        bundle=bundle,
+                        est=est,
+                        sensors_reply=sensors_reply,
+                        latency_s=latency,
+                        step=step,
+                        termination=termination,
+                    )
+                    self.telemetry_broadcaster.update_frame(frame)
+                except Exception:
+                    pass
 
             step += 1
             self._total_steps += 1
@@ -598,7 +829,7 @@ class MissionEngine:
                 break
 
             # missão completa
-            if self.hrl.n3.mission_complete:
+            if not self._manual_mode and self.hrl.n3.mission_complete:
                 termination = EpisodeTermination.MISSION_COMPLETE
                 break
 
@@ -606,7 +837,7 @@ class MissionEngine:
             termination = EpisodeTermination.TIMEOUT
 
         # ── Atualização PPO ───────────────────
-        if training:
+        if training and not self._manual_mode:
             _, _, last_val = self.hrl.n1.network.act(
                 self.hrl.n1.get_observation(bundle.imu, est)
             )
@@ -622,8 +853,8 @@ class MissionEngine:
             total_reward_n1=total_r_n1,
             total_reward_n2=total_r_n2,
             total_reward_n3=total_r_n3,
-            waypoints_reached=self.hrl.n3.current_wp_idx,
-            total_waypoints=len(waypoints),
+            waypoints_reached=0 if self._manual_mode else self.hrl.n3.current_wp_idx,
+            total_waypoints=0 if self._manual_mode else len(waypoints),
             phase=self._phase,
             collision=(termination == EpisodeTermination.COLLISION),
         )

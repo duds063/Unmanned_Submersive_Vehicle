@@ -23,10 +23,11 @@ Referências:
     - Franklin et al. (2015) — Feedback Control of Dynamic Systems
 """
 
+import threading
 import numpy as np
 from scipy.linalg import solve_continuous_are
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 from sensor_engine import EKFState
 
 
@@ -77,6 +78,91 @@ class ControlCommand:
         }
 
 
+def _neutral_command() -> ControlCommand:
+    return ControlCommand(
+        thruster_power=0.0,
+        thruster_theta=0.0,
+        thruster_phi=0.0,
+        ballast_cmd=0.0,
+        thruster2_power=0.0,
+        thruster2_theta=0.0,
+        thruster2_phi=0.0,
+    )
+
+
+class ManualCommandSource:
+    """Source of manual commands for teleop, replay, or scripted input."""
+
+    def read(self, ekf_state: Optional[EKFState], time_s: float) -> Optional[ControlCommand]:
+        raise NotImplementedError
+
+
+class FixedManualCommandSource(ManualCommandSource):
+    """Always returns the latest fixed command."""
+
+    def __init__(self, command: Optional[ControlCommand] = None):
+        self._command = command.clip() if command is not None else _neutral_command()
+
+    def set_command(self, command: ControlCommand) -> None:
+        self._command = command.clip()
+
+    def read(self, ekf_state: Optional[EKFState], time_s: float) -> Optional[ControlCommand]:
+        return self._command
+
+
+class SequenceManualCommandSource(ManualCommandSource):
+    """Plays back a finite sequence of commands, holding the last one."""
+
+    def __init__(self, commands: Sequence[ControlCommand]):
+        self._commands = [cmd.clip() for cmd in commands]
+        self._index = 0
+
+    def read(self, ekf_state: Optional[EKFState], time_s: float) -> Optional[ControlCommand]:
+        if not self._commands:
+            return _neutral_command()
+        idx = min(self._index, len(self._commands) - 1)
+        command = self._commands[idx]
+        if self._index < len(self._commands) - 1:
+            self._index += 1
+        return command
+
+
+class QueuedManualCommandSource(ManualCommandSource):
+    """Thread-safe latest-command source for keyboard or network teleop."""
+
+    def __init__(self, initial_command: Optional[ControlCommand] = None):
+        self._latest = initial_command.clip() if initial_command is not None else _neutral_command()
+        self._lock = threading.Lock()
+
+    def push(self, command: ControlCommand) -> None:
+        with self._lock:
+            self._latest = command.clip()
+
+    def read(self, ekf_state: Optional[EKFState], time_s: float) -> Optional[ControlCommand]:
+        with self._lock:
+            return self._latest
+
+
+class ManualController:
+    """Thin adapter that exposes a command source through the controller API."""
+
+    def __init__(self, source: Optional[ManualCommandSource] = None):
+        self._source = source or FixedManualCommandSource()
+
+    def set_source(self, source: ManualCommandSource) -> None:
+        self._source = source
+
+    @property
+    def source(self) -> ManualCommandSource:
+        return self._source
+
+    def compute(self, ekf_state: EKFState, time: float) -> ControlCommand:
+        command = self._source.read(ekf_state, time)
+        if command is None:
+            command = _neutral_command()
+        return command.clip()
+
+
 @dataclass
 class ControllerState:
     """Estado interno do controlador para telemetria."""
@@ -103,7 +189,7 @@ class LQRWeights:
 
     Intuição física:
         Q alto em z    → prioriza manter profundidade
-        Q alto em φ,θ  → prioriza manter atitude
+        Q alto em φ,θ  → prioriza manter atitude (roll/pitch)
         R alto         → minimiza uso do propulsor (economia de bateria)
     """
     # pesos de estado Q — diagonal (12 valores)
@@ -461,14 +547,29 @@ class SystemLinearizer:
         import copy
         self._physics_copy = copy.deepcopy(physics_engine)
 
-    @staticmethod
-    def operating_input() -> np.ndarray:
-        """Entrada de operação usada na linearização (u0)."""
-        return np.array([
-            0.15, np.radians(15), np.radians(90),   # thruster 1
-            0.15, np.radians(15), np.radians(90),   # thruster 2
-            0.0,                                    # ballast
-        ], dtype=float)
+    def operating_input(self) -> np.ndarray:
+        """Entrada de operação usada na linearização (u0).
+
+        Retorna um vetor com formato por-atuador: [p,t,phi, p,t,phi, ..., ballast].
+        Mantém compatibilidade com o formato legado (7 elementos) quando o
+        número de thrusters for 2.
+        """
+        # Determine number of thrusters available in the physics copy
+        thrusters = getattr(self._physics_copy, 'thrusters', None)
+        n = len(thrusters) if thrusters is not None else 2
+
+        # default per-thruster operating point: small forward power and deflection
+        power = 0.15
+        theta = np.radians(15.0)
+        phi = np.radians(90.0)
+
+        u = []
+        for _ in range(n):
+            u.extend([power, theta, phi])
+
+        # ballast as final element
+        u.append(0.0)
+        return np.asarray(u, dtype=float)
 
     def linearize(self, z0: float = 2.0) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -491,9 +592,7 @@ class SystemLinearizer:
         x0[2] = z0
 
         # entrada de operação: propulsor com potência e deflexão leves
-        # CRÍTICO: power=0 zera o canal theta em B porque F_z = power*F_max*sin(theta)
-        # é bilinear — dF_z/dtheta = power*F_max*cos(theta) = 0 quando power=0.
-        # Com power=0.3 e theta=15°, todos os canais ficam visíveis na linearização.
+        # u0 agora tem formato por-atuador: [p,t,phi, ... , ballast]
         u0 = self.operating_input()
 
         # Jacobiana A = ∂f/∂x numericamente
@@ -536,20 +635,69 @@ class SystemLinearizer:
         eta = x[:6]
         nu  = x[6:]
 
-        # --- propulsores: bypass do clip para diferença centrada correta ---
-        p.thruster_port._power = float(np.clip(u[0], -1.0, 1.0))
-        p.thruster_port._theta = float(u[1])
-        p.thruster_port._phi   = float(u[2] % (2 * np.pi))
+        # --- propulsores: distribute the two-channel perturbation across the
+        # available thrusters in the physics copy so the linearization reflects
+        # the actual multi-thruster layout.
+        # Support two input formats:
+        #  - legacy dual-thruster: len(u) == 7 -> [p1,t1,phi1,p2,t2,phi2,ballast]
+        #  - per-thruster: len(u) == 3*N + 1 -> [p0,t0,phi0, p1,t1,phi1, ..., ballast]
+        thrusters = getattr(p, 'thrusters', None)
+        if thrusters is None:
+            thrusters = [p.thruster_port, p.thruster_starboard]
 
-        p.thruster_starboard._power = float(np.clip(u[3], -1.0, 1.0))
-        p.thruster_starboard._theta = float(u[4])
-        p.thruster_starboard._phi   = float(u[5] % (2 * np.pi))
+        if len(u) == 7:
+            # legacy behaviour: distribute p1/p2 across port/star groups
+            p1 = float(np.clip(u[0], -1.0, 1.0))
+            t1 = float(u[1])
+            f1 = float(u[2] % (2 * np.pi))
+            p2 = float(np.clip(u[3], -1.0, 1.0))
+            t2 = float(u[4])
+            f2 = float(u[5] % (2 * np.pi))
+
+            port_indices = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) > 0.0]
+            star_indices = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) <= 0.0]
+            if not port_indices:
+                port_indices = [0]
+            if not star_indices:
+                star_indices = [1 if len(thrusters) > 1 else 0]
+
+            p_port_share = p1 / float(len(port_indices))
+            p_star_share = p2 / float(len(star_indices))
+
+            for i, th in enumerate(thrusters):
+                if i in port_indices:
+                    th._power = np.clip(p_port_share, -1.0, 1.0)
+                    th._theta = t1
+                    th._phi = f1
+                else:
+                    th._power = np.clip(p_star_share, -1.0, 1.0)
+                    th._theta = t2
+                    th._phi = f2
+
+        else:
+            # per-thruster format
+            n_thr = (len(u) - 1) // 3
+            powers = [float(np.clip(u[3 * i + 0], -1.0, 1.0)) for i in range(n_thr)]
+            thetas = [float(u[3 * i + 1]) for i in range(n_thr)]
+            phis = [float(u[3 * i + 2] % (2 * np.pi)) for i in range(n_thr)]
+
+            # map provided per-thruster values to available thrusters (by index)
+            for i, th in enumerate(thrusters):
+                if i < n_thr:
+                    th._power = powers[i]
+                    th._theta = thetas[i]
+                    th._phi = phis[i]
+                else:
+                    # if fewer inputs than thrusters, set remaining to zero
+                    th._power = 0.0
+                    th._theta = 0.0
+                    th._phi = 0.0
 
         # --- ballast: perturbação como fração do range de massa físico ---
         # range total de massa = mass_max - mass_min (determinado pela geometria)
         # u[3] ∈ [-1, 1] mapeia para ±50% do range — escala física, não temporal
         half_range = 0.5 * (p.ballast.mass_max - p.ballast.mass_min)
-        dm = np.clip(u[6], -1.0, 1.0) * half_range
+        dm = np.clip(u[-1], -1.0, 1.0) * half_range
         p.ballast._water_mass = np.clip(
             p.ballast.mass_min + 0.5 * (p.ballast.mass_max - p.ballast.mass_min) + dm,
             p.ballast.mass_min,
@@ -625,15 +773,16 @@ class LQRController:
         self._control_engine = None  # set by ControlEngine after instantiation for waypoint detection
         self.weights     = weights or LQRWeights()
         self.hover_depth = hover_depth
-        self.adaptive_relinearization = adaptive_relinearization
-        self.relinearization_interval_s = float(max(0.2, relinearization_interval_s))
-        self._last_relinearization_time = -np.inf
-        self._guidance_tuning = guidance_tuning or {}
-
-        # lineariza o sistema uma vez
-        self.linearizer = SystemLinearizer(physics_engine)
+        # ensure the SystemLinearizer exists before use
+        self.linearizer = SystemLinearizer(self.physics)
         self.A, self.B  = self.linearizer.linearize(z0=hover_depth)
         self._u_op      = self.linearizer.operating_input()
+        # adaptive relinearization settings
+        self.adaptive_relinearization = bool(adaptive_relinearization)
+        self.relinearization_interval_s = float(relinearization_interval_s)
+        self._last_relinearization_time = 0.0
+        # guidance tuning defaults
+        self._guidance_tuning = guidance_tuning or {}
 
         # verifica controlabilidade
         ctrl = self.linearizer.check_controllability(self.A, self.B)
@@ -655,16 +804,23 @@ class LQRController:
         self._last_effort = np.zeros(self.B.shape[1])
         self._last_u_cmd = np.zeros(self.B.shape[1])
         self._last_time = None
+
         # Limites de taxa por segundo para reduzir ciclos limite por saturacao.
-        self._du_rate_limits = np.array([
-            2.0,
-            np.radians(120.0),
-            np.radians(360.0),
-            2.0,
-            np.radians(120.0),
-            np.radians(360.0),
-            1.0,
-        ], dtype=float)
+        # Construídos dinamicamente para cobrir entradas por-atuador (p,theta,phi...)
+        n_inputs = self.B.shape[1]
+        # default pattern per thruster: [power_rate, theta_rate, phi_rate]
+        per_thr_rates = [2.0, np.radians(120.0), np.radians(360.0)]
+        rates = []
+        # all but last are thruster params; last is ballast
+        n_thr_like = max(0, (n_inputs - 1) // 3)
+        for _ in range(n_thr_like):
+            rates.extend(per_thr_rates)
+        # if there are leftover columns (non-multiple of 3), fill with conservative defaults
+        while len(rates) < n_inputs - 1:
+            rates.append(2.0)
+        # ballast rate
+        rates.append(1.0)
+        self._du_rate_limits = np.asarray(rates[:n_inputs], dtype=float)
 
     # ─── Interface pública ───────────────────
 
@@ -863,17 +1019,20 @@ class LQRController:
         return K
 
     def _lqr_R_matrix(self) -> np.ndarray:
-        """Matriz R específica do LQR dual-thruster (7x7)."""
+        """Matriz R adaptativa: repete pesos por-atuador e termina com lastro."""
         wt = self.weights
-        return np.diag([
-            wt.r_thrust_power,
-            wt.r_thrust_theta,
-            wt.r_thrust_phi,
-            wt.r_thrust_power,
-            wt.r_thrust_theta,
-            wt.r_thrust_phi,
-            wt.r_ballast,
-        ])
+        n = self.B.shape[1]
+        diag = []
+        # assume pattern [power, theta, phi] for thruster columns
+        n_thr_like = max(0, (n - 1) // 3)
+        for _ in range(n_thr_like):
+            diag.extend([wt.r_thrust_power, wt.r_thrust_theta, wt.r_thrust_phi])
+        # if odd leftover columns, fill with reasonable defaults
+        while len(diag) < n - 1:
+            diag.append(wt.r_thrust_power)
+        # ballast at the end
+        diag.append(wt.r_ballast)
+        return np.diag(np.asarray(diag[:n], dtype=float))
 
     # ─── Conversão de controle ───────────────
 
@@ -886,13 +1045,66 @@ class LQRController:
         u[2] → thruster_phi    — deflexão lateral (yaw/sway)
         u[3] → ballast_cmd     — controle de profundidade
         """
-        # LQR dual-thruster: u = [p1,t1,ph1,p2,t2,ph2,ballast].
-        # Compatibilidade: se vier vetor 4D, usa mapeamento espelhado.
-        if len(u) >= 7:
-            p1, t1, f1, p2, t2, f2, b = u[:7]
+        # If per-thruster control provided (len(u) > 7), aggregate to dual-thruster
+        if len(u) >= 7 and (len(u) - 1) % 3 == 0 and len(u) != 7:
+            # per-thruster layout
+            n_thr = (len(u) - 1) // 3
+            powers = [float(np.clip(u[3 * i + 0], -1.0, 1.0)) for i in range(n_thr)]
+            thetas = [float(u[3 * i + 1]) for i in range(n_thr)]
+            phis = [float(u[3 * i + 2] % (2 * np.pi)) for i in range(n_thr)]
+
+            # split thrusters by side using physics geometry
+            thrusters = getattr(self.physics, 'thrusters', None)
+            if thrusters is None:
+                # fallback to two virtual thrusters
+                p_port_total = sum(powers[:max(1, n_thr//2)])
+                p_star_total = sum(powers[max(1, n_thr//2):])
+                t1 = thetas[0] if thetas else 0.0
+                f1 = phis[0] if phis else 0.0
+                t2 = thetas[-1] if thetas else 0.0
+                f2 = phis[-1] if phis else 0.0
+            else:
+                port_idxs = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) > 0.0]
+                star_idxs = [i for i, th in enumerate(thrusters) if float(th.position_body[1]) <= 0.0]
+                if not port_idxs:
+                    port_idxs = [0]
+                if not star_idxs:
+                    star_idxs = [min(len(thrusters)-1, 1)]
+
+                p_port_total = 0.0
+                p_star_total = 0.0
+                t1_vals = []
+                f1_vals = []
+                t2_vals = []
+                f2_vals = []
+                for i in range(len(thrusters)):
+                    if i < n_thr:
+                        if i in port_idxs:
+                            p_port_total += powers[i]
+                            t1_vals.append(thetas[i])
+                            f1_vals.append(phis[i])
+                        else:
+                            p_star_total += powers[i]
+                            t2_vals.append(thetas[i])
+                            f2_vals.append(phis[i])
+
+                t1 = float(np.mean(t1_vals) if t1_vals else 0.0)
+                f1 = float(np.mean(f1_vals) if f1_vals else 0.0)
+                t2 = float(np.mean(t2_vals) if t2_vals else 0.0)
+                f2 = float(np.mean(f2_vals) if f2_vals else 0.0)
+
+            p1, t1, f1, p2, t2, f2, b = (
+                p_port_total, t1, f1, p_star_total, t2, f2, float(np.clip(u[-1], -1.0, 1.0))
+            )
+
         else:
-            p1, t1, f1, b = u[:4]
-            p2, t2, f2 = p1, t1, f1
+            # LQR dual-thruster: u = [p1,t1,ph1,p2,t2,ph2,ballast].
+            # Compatibilidade: se vier vetor 4D, usa mapeamento espelhado.
+            if len(u) >= 7:
+                p1, t1, f1, p2, t2, f2, b = u[:7]
+            else:
+                p1, t1, f1, b = u[:4]
+                p2, t2, f2 = p1, t1, f1
 
         return ControlCommand(
             thruster_power=float(np.clip(p1, -1.0, 1.0)),
@@ -927,7 +1139,7 @@ class ControlEngine:
         physics.step(**cmd.__dict__, dt=0.01)
     """
 
-    CONTROLLERS = ['lqr', 'mpc', 'rl']
+    CONTROLLERS = ['lqr', 'mpc', 'rl', 'manual']
 
     def __init__(self, physics_engine, hover_depth: float = 2.0):
         self.physics     = physics_engine
@@ -942,6 +1154,7 @@ class ControlEngine:
         self._lqr._control_engine = self  # enable waypoint detection in LQR
         self._mpc = None   # implementado no próximo módulo
         self._rl  = None   # implementado no próximo módulo
+        self._manual = ManualController()
 
         self._active = 'lqr'
         self._reference = np.array([0.0, 0.0, hover_depth])
@@ -1059,6 +1272,10 @@ class ControlEngine:
 
         self._active = name
         print(f"✓ Controlador ativo: {name.upper()}")
+
+    def set_manual_source(self, source: ManualCommandSource) -> None:
+        """Define a origem dos comandos quando o modo manual estiver ativo."""
+        self._manual.set_source(source)
 
     def set_reference(
         self,
@@ -1180,6 +1397,9 @@ class ControlEngine:
 
     def compute(self, ekf_state: EKFState, time: float) -> ControlCommand:
         """Calcula comando usando o controlador ativo."""
+        if self._active == 'manual':
+            return self._manual.compute(ekf_state, time)
+
         if self._active in ('lqr', 'mpc'):
             self.check_waypoint_reached(self._navigation_position())
             target, yaw = self._guidance_target_and_yaw(ekf_state.position)

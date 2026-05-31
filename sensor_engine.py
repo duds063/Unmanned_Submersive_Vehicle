@@ -24,6 +24,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from physics_engine import VehicleState, PhysicsEngine
+import time
+import json
 
 
 # ─────────────────────────────────────────────
@@ -119,6 +121,21 @@ class SensorBundle:
             },
             'timestamp': self.timestamp,
         }
+
+
+@dataclass
+class SensorFaultProfile:
+    """Configuração de falhas para HIL de validação."""
+
+    imu_dropout_prob: float = 0.0
+    sonar_dropout_prob: float = 0.0
+    baro_dropout_prob: float = 0.0
+    imu_accel_bias: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    imu_gyro_bias: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    baro_depth_bias: float = 0.0
+    sonar_range_scale: float = 1.0
+    sonar_confidence_scale: float = 1.0
+    temporal_jitter_s: float = 0.0
 
 
 @dataclass
@@ -341,6 +358,17 @@ class SensorEngine:
         self._harmonic_dirs = None
         self._harmonic_amps = None
 
+        # HIL-related options
+        self.hil_enabled = False
+        self.hil_latency = 0.0        # seconds to emulate processing/tx
+        self.hil_packet_loss = 0.0    # probability [0,1] to drop incoming frames
+        self.hil_jitter_ms = 0.0      # std dev of random jitter in ms
+        self.hil_sensor_fault_rate = 0.0  # probability [0,1] per-frame to inject a sensor fault
+        self.hil_sensor_fault_types = ['drop', 'stuck', 'spike', 'extra_noise']
+        self._fault_stuck_values = {}
+        self.fault_profile = SensorFaultProfile()
+        self._last_fault_bundle: Optional[SensorBundle] = None
+
     # ─── Interface pública ───────────────────
 
     def read(self, state: VehicleState, time: float) -> SensorBundle:
@@ -351,12 +379,324 @@ class SensorEngine:
         sonar     = self._read_sonar(state, time)
         barometer = self._read_barometer(state, time)
 
+        if self.hil_enabled and self.hil_jitter_ms > 0.0:
+            import time as _time
+            jitter = float(self.rng.normal(0.0, self.hil_jitter_ms)) / 1000.0
+            _time.sleep(max(0.0, jitter))
+
         return SensorBundle(
             imu=imu,
             sonar=sonar,
             barometer=barometer,
             timestamp=time,
         )
+
+    # ─── HIL integration helpers ───────────────────
+
+    def set_hil_mode(
+        self,
+        enabled: bool,
+        latency_s: float = 0.0,
+        packet_loss: float = 0.0,
+        jitter_ms: float = None,
+        jitter_mean_s: float = None,
+        jitter_std_s: float = None,
+    ) -> None:
+        """Configure HIL emulation parameters.
+
+        When `enabled` is True, `read_from_hardware()` will simulate latency
+        and packet loss. `packet_loss` is the probability [0,1] that an
+        incoming hardware frame is dropped.
+        """
+        self.hil_enabled = bool(enabled)
+        self.hil_latency = max(0.0, float(latency_s))
+        self.hil_packet_loss = float(np.clip(packet_loss, 0.0, 1.0))
+        # backwards-compatible handling: accept legacy jitter_mean_s / jitter_std_s (seconds)
+        if jitter_ms is not None:
+            self.hil_jitter_ms = max(0.0, float(jitter_ms))
+        else:
+            jm = 0.0
+            if jitter_mean_s is not None:
+                jm = max(jm, abs(float(jitter_mean_s)) * 1000.0)
+            if jitter_std_s is not None:
+                jm = max(jm, abs(float(jitter_std_s)) * 1000.0)
+            self.hil_jitter_ms = max(0.0, float(jm))
+        # keep legacy attributes for tests/code that reference them
+        self.hil_jitter_mean_s = float(jitter_mean_s or 0.0)
+        self.hil_jitter_std_s = float(jitter_std_s or 0.0)
+
+    def set_fault_profile(self, fault_profile: Optional[SensorFaultProfile]) -> None:
+        """Define o perfil de falhas para validação HIL."""
+        self.fault_profile = fault_profile or SensorFaultProfile()
+
+    def clear_fault_profile(self) -> None:
+        self.fault_profile = SensorFaultProfile()
+
+    def set_hil_faults(self, jitter_ms: float = 0.0, sensor_fault_rate: float = 0.0, fault_types: list = None) -> None:
+        """Configure HIL stochastic fault injection parameters.
+
+        - `jitter_ms`: per-packet jitter stddev in milliseconds
+        - `sensor_fault_rate`: probability [0,1] to inject a random fault per frame
+        - `fault_types`: list of allowed fault types (drop, stuck, spike, extra_noise)
+        """
+        self.hil_jitter_ms = max(0.0, float(jitter_ms))
+        self.hil_sensor_fault_rate = float(np.clip(sensor_fault_rate, 0.0, 1.0))
+        if fault_types is not None:
+            self.hil_sensor_fault_types = fault_types
+
+    def _apply_sensor_faults(self, bundle: SensorBundle) -> SensorBundle:
+        """Aplica corrupção/degradação em sensores para validação."""
+        fp = self.fault_profile
+
+        # IMU: bias + dropout via dados atrasados/estáticos quando possível.
+        if self.rng.random() < fp.imu_dropout_prob and self._last_fault_bundle is not None:
+            bundle.imu.accel = self._last_fault_bundle.imu.accel.copy()
+            bundle.imu.gyro = self._last_fault_bundle.imu.gyro.copy()
+        else:
+            bundle.imu.accel = bundle.imu.accel + np.asarray(fp.imu_accel_bias, dtype=float)
+            bundle.imu.gyro = bundle.imu.gyro + np.asarray(fp.imu_gyro_bias, dtype=float)
+
+        # Sonar: dropout e escala de alcance/confiança.
+        for reading in bundle.sonar:
+            if self.rng.random() < fp.sonar_dropout_prob:
+                reading.distance = -1.0
+                reading.confidence = 0.0
+            elif reading.distance > 0:
+                reading.distance *= float(max(0.0, fp.sonar_range_scale))
+                reading.confidence *= float(max(0.0, fp.sonar_confidence_scale))
+
+        # Barômetro: bias ou fallback para valor anterior.
+        if self.rng.random() < fp.baro_dropout_prob and self._last_fault_bundle is not None:
+            bundle.barometer.depth = float(self._last_fault_bundle.barometer.depth)
+            bundle.barometer.pressure = float(self._last_fault_bundle.barometer.pressure)
+        else:
+            bundle.barometer.depth += float(fp.baro_depth_bias)
+            bundle.barometer.pressure = RHO_FRESHWATER * G * bundle.barometer.depth
+
+        self._last_fault_bundle = bundle
+        return bundle
+
+    def parse_hardware_frame(self, frame: dict) -> Optional[SensorBundle]:
+        """Parse a hardware-provided sensor frame (dict) into a SensorBundle.
+
+        Expected frame formats (flexible):
+          - {'imu': {'accel':[...], 'gyro':[...], 'timestamp': t},
+             'sonar': [ { 'direction':[...], 'distance':d, 'confidence':c, 'timestamp':t }, ... ],
+             'barometer': {'depth': d, 'pressure': p, 'timestamp': t },
+             'timestamp': t }
+
+        Returns None if frame is invalid.
+        """
+        if not isinstance(frame, dict) or not frame:
+            return None
+
+        now = time.time()
+
+        # IMU
+        imu_frame = frame.get('imu')
+        if imu_frame and 'accel' in imu_frame and 'gyro' in imu_frame:
+            accel = np.array(imu_frame['accel'], dtype=float)
+            gyro  = np.array(imu_frame['gyro'], dtype=float)
+            ts    = float(imu_frame.get('timestamp', now))
+            imu = IMUReading(accel=accel, gyro=gyro, velocity=None, timestamp=ts)
+        else:
+            imu = None
+
+        # Sonar
+        sonar_list = []
+        sframe = frame.get('sonar')
+        if isinstance(sframe, list):
+            for s in sframe:
+                try:
+                    dirv = np.array(s.get('direction', [0.0, 0.0, 0.0]), dtype=float)
+                    dist = float(s.get('distance', -1.0))
+                    conf = float(s.get('confidence', 0.0))
+                    ts_s = float(s.get('timestamp', now))
+                    sonar_list.append(SonarReading(direction=dirv, distance=dist, confidence=conf, timestamp=ts_s))
+                except Exception:
+                    continue
+
+        # Barometer
+        bar_frame = frame.get('barometer')
+        if bar_frame and 'depth' in bar_frame:
+            depth = float(bar_frame.get('depth', 0.0))
+            pressure = float(bar_frame.get('pressure', RHO_FRESHWATER * G * depth))
+            ts_b = float(bar_frame.get('timestamp', now))
+            baro = BarometerReading(depth=depth, pressure=pressure, timestamp=ts_b)
+        else:
+            baro = None
+
+        # if we have at least one of the sensors, build a SensorBundle
+        if imu is None and not sonar_list and baro is None:
+            return None
+
+        # fill missing with simulated defaults by calling `read()` with a dummy state
+        dummy_state = VehicleState()
+        current_time = now
+        if imu is None or baro is None or not sonar_list:
+            sim_bundle = self.read(dummy_state, current_time)
+            if imu is None:
+                imu = sim_bundle.imu
+            if not sonar_list:
+                sonar_list = sim_bundle.sonar
+            if baro is None:
+                baro = sim_bundle.barometer
+
+        return self._apply_sensor_faults(SensorBundle(imu=imu, sonar=sonar_list, barometer=baro, timestamp=current_time))
+
+    def read_from_hardware(self, frame) -> Optional[SensorBundle]:
+        """Emulate receiving a hardware frame: accept dict, bytes or JSON string.
+
+        Behavior:
+          - If HIL packet-loss is enabled, randomly drop the frame and return None.
+          - If HIL latency is set, sleep to emulate processing/transmission delay.
+          - Accept `frame` as a `dict` (already parsed), `bytes` (JSON) or
+            `str` (JSON text). Binary sensor frames are not yet defined and
+            will be treated as invalid.
+
+        Returns a SensorBundle or None if packet was dropped or invalid.
+        """
+        # packet loss
+        if self.hil_enabled and self.rng.random() < self.hil_packet_loss:
+            return None
+
+        # latency
+        if self.hil_enabled and self.hil_latency > 0.0:
+            time.sleep(self.hil_latency)
+
+        if self.hil_enabled and self.hil_jitter_ms > 0.0:
+            jitter = float(self.rng.normal(0.0, self.hil_jitter_ms)) / 1000.0
+            time.sleep(max(0.0, jitter))
+
+        # accept bytes / str (JSON) or dict
+        parsed_frame = None
+        if isinstance(frame, bytes):
+            try:
+                parsed_frame = json.loads(frame.decode('utf-8'))
+            except Exception:
+                # try HIL binary sensor format without top-level import to avoid circular imports
+                try:
+                    from hil_interface import HILProtocol
+                    parsed_frame = HILProtocol.deserialize_binary_sensor(frame)
+                except Exception:
+                    parsed_frame = None
+        elif isinstance(frame, str):
+            try:
+                parsed_frame = json.loads(frame)
+            except Exception:
+                parsed_frame = None
+        elif isinstance(frame, dict):
+            parsed_frame = frame
+        else:
+            parsed_frame = None
+
+        if parsed_frame is None:
+            return None
+
+        bundle = self.parse_hardware_frame(parsed_frame)
+        if bundle is not None:
+            # Apply lightweight HIL stochastic fault injection (configurable)
+            if self.hil_enabled and self.hil_sensor_fault_rate > 0.0 and self.rng.random() < self.hil_sensor_fault_rate:
+                ftype = str(self.rng.choice(self.hil_sensor_fault_types))
+                if ftype == 'drop':
+                    return None
+                if ftype == 'stuck':
+                    if 'imu' in self._fault_stuck_values:
+                        bundle.imu = self._fault_stuck_values['imu']
+                    else:
+                        self._fault_stuck_values['imu'] = bundle.imu
+                    if 'barometer' in self._fault_stuck_values:
+                        bundle.barometer = self._fault_stuck_values['barometer']
+                    else:
+                        self._fault_stuck_values['barometer'] = bundle.barometer
+                if ftype == 'spike':
+                    try:
+                        bundle.imu.accel = bundle.imu.accel + np.array([float(self.rng.normal(0.0, 5.0)) for _ in range(3)])
+                        bundle.imu.gyro  = bundle.imu.gyro  + np.array([float(self.rng.normal(0.0, 1.0)) for _ in range(3)])
+                    except Exception:
+                        pass
+                if ftype == 'extra_noise':
+                    try:
+                        bundle.imu.accel = bundle.imu.accel + np.array([float(self.rng.normal(0.0, 0.5)) for _ in range(3)])
+                        bundle.imu.gyro  = bundle.imu.gyro  + np.array([float(self.rng.normal(0.0, 0.05)) for _ in range(3)])
+                    except Exception:
+                        pass
+            return bundle
+
+        # Fallback: tolerant construction for minimal frames (imu/baro present)
+        now = time.time()
+        imu = None
+        baro = None
+        sonar_list = []
+
+        imu_frame = parsed_frame.get('imu') if isinstance(parsed_frame, dict) else None
+        if imu_frame and 'accel' in imu_frame and 'gyro' in imu_frame:
+            try:
+                accel = np.array(imu_frame['accel'], dtype=float)
+                gyro = np.array(imu_frame['gyro'], dtype=float)
+                ts = float(imu_frame.get('timestamp', now))
+                imu = IMUReading(accel=accel, gyro=gyro, velocity=None, timestamp=ts)
+            except Exception:
+                imu = None
+
+        bar_frame = parsed_frame.get('barometer') if isinstance(parsed_frame, dict) else None
+        if bar_frame and 'depth' in bar_frame:
+            try:
+                depth = float(bar_frame.get('depth', 0.0))
+                pressure = float(bar_frame.get('pressure', RHO_FRESHWATER * G * depth))
+                ts_b = float(bar_frame.get('timestamp', now))
+                baro = BarometerReading(depth=depth, pressure=pressure, timestamp=ts_b)
+            except Exception:
+                baro = None
+
+        if imu is None and baro is None and not sonar_list:
+            return None
+
+        # fill missing sensors from simulation defaults
+        if imu is None or baro is None or not sonar_list:
+            dummy_state = VehicleState()
+            sim_bundle = self.read(dummy_state, now)
+            if imu is None:
+                imu = sim_bundle.imu
+            if not sonar_list:
+                sonar_list = sim_bundle.sonar
+            if baro is None:
+                baro = sim_bundle.barometer
+
+        bundle = SensorBundle(imu=imu, sonar=sonar_list, barometer=baro, timestamp=now)
+
+        # Apply lightweight HIL stochastic fault injection (configurable)
+        if self.hil_enabled and self.hil_sensor_fault_rate > 0.0 and self.rng.random() < self.hil_sensor_fault_rate:
+            ftype = str(self.rng.choice(self.hil_sensor_fault_types))
+            # drop entire frame
+            if ftype == 'drop':
+                return None
+            # stuck: keep previous values if available, otherwise freeze current
+            if ftype == 'stuck':
+                if 'imu' in self._fault_stuck_values:
+                    bundle.imu = self._fault_stuck_values['imu']
+                else:
+                    self._fault_stuck_values['imu'] = bundle.imu
+                if 'barometer' in self._fault_stuck_values:
+                    bundle.barometer = self._fault_stuck_values['barometer']
+                else:
+                    self._fault_stuck_values['barometer'] = bundle.barometer
+            # spike: large transient bias
+            if ftype == 'spike':
+                try:
+                    bundle.imu.accel = bundle.imu.accel + np.array([float(self.rng.normal(0.0, 5.0)) for _ in range(3)])
+                    bundle.imu.gyro  = bundle.imu.gyro  + np.array([float(self.rng.normal(0.0, 1.0)) for _ in range(3)])
+                except Exception:
+                    pass
+            # extra_noise: raise noise floor
+            if ftype == 'extra_noise':
+                try:
+                    bundle.imu.accel = bundle.imu.accel + np.array([float(self.rng.normal(0.0, 0.5)) for _ in range(3)])
+                    bundle.imu.gyro  = bundle.imu.gyro  + np.array([float(self.rng.normal(0.0, 0.05)) for _ in range(3)])
+                except Exception:
+                    pass
+
+        return bundle
 
     def detect_waypoint(
         self,
