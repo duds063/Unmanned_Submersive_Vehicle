@@ -142,6 +142,48 @@ def on_seek_replay(data):
     emit('status', {'replay_seek_s': playhead})
 
 
+@socketio.on('step_replay')
+def on_step_replay(data):
+    payload = _safe_payload(data)
+    mode = str(payload.get('step_mode', 'frame')).strip().lower()
+    if mode == 'time':
+        delta_s = float(payload.get('delta_s', 0.1))
+        playhead = player.step_time(delta_s)
+    else:
+        direction = int(payload.get('direction', 1))
+        playhead = player.step_frames(direction)
+    emit('replay_status', player.status())
+    emit('status', {'replay_seek_s': playhead, 'step_mode': mode})
+
+
+@socketio.on('set_scope_channels')
+def on_set_scope_channels(data):
+    payload = _safe_payload(data)
+    channels = payload.get('channels', [])
+    if not isinstance(channels, list):
+        channels = []
+    selected = player.set_scope_channels([str(ch) for ch in channels])
+    emit('replay_status', player.status())
+    emit('status', {'scope_channels': selected})
+
+
+@socketio.on('set_scope_preset')
+def on_set_scope_preset(data):
+    payload = _safe_payload(data)
+    preset = str(payload.get('preset', 'default'))
+    selected = player.set_scope_preset(preset)
+    emit('replay_status', player.status())
+    emit('status', {'scope_channels': selected, 'preset': preset})
+
+
+@socketio.on('set_overlay_mode')
+def on_set_overlay_mode(data):
+    payload = _safe_payload(data)
+    mode = player.set_overlay_mode(str(payload.get('mode', 'time')))
+    emit('replay_status', player.status())
+    emit('status', {'overlay_mode': mode})
+
+
 @socketio.on('load_replay')
 def on_load_replay(data):
     payload = _safe_payload(data)
@@ -327,6 +369,21 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     grid-column: 3;
     grid-row: 1;
     align-self: start;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+  }
+
+  #panel-scope {
+    margin-top: 12px;
+  }
+
+  #scope-canvas {
+    width: 100%;
+    height: 190px;
+    display: block;
+    border: 1px solid var(--border);
+    background: rgba(0, 16, 24, 0.75);
+    border-radius: 2px;
   }
 
   .btn-group {
@@ -718,6 +775,47 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <select id="replay-compare-select" class="mini-input" multiple size="4" onchange="selectReplayTrials()"></select>
     </div>
 
+    <div class="panel" id="panel-scope">
+      <div class="panel-title">Oscilloscope</div>
+
+      <div class="btn-group">
+        <button class="btn" onclick="stepReplayFrame(-1)">Step -1</button>
+        <button class="btn" onclick="stepReplayFrame(1)">Step +1</button>
+      </div>
+
+      <div class="btn-group">
+        <button class="btn active" id="overlay-time" onclick="setOverlayMode('time')">Time</button>
+        <button class="btn" id="overlay-normalized" onclick="setOverlayMode('normalized')">Normalized</button>
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-label"><span>Preset</span><span id="scope-preset-label">default</span></div>
+        <select id="scope-preset-select" class="mini-input" onchange="setScopePreset()">
+          <option value="default">default</option>
+          <option value="velocity">velocity</option>
+          <option value="attitude">attitude</option>
+        </select>
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-label"><span>Channels</span><span id="scope-channel-count">0</span></div>
+        <select id="scope-channel-select" class="mini-input" multiple size="6" onchange="setScopeChannels()">
+          <option value="u">u</option>
+          <option value="v">v</option>
+          <option value="w">w</option>
+          <option value="p">p</option>
+          <option value="q">q</option>
+          <option value="r">r</option>
+          <option value="phi">phi</option>
+          <option value="theta">theta</option>
+          <option value="psi">psi</option>
+          <option value="ekf_error">ekf_error</option>
+        </select>
+      </div>
+
+      <canvas id="scope-canvas" width="360" height="190"></canvas>
+    </div>
+
     <div class="benchmark-board" id="benchmark-results"></div>
     <div class="benchmark-status" style="margin-top:10px">Replay catalog</div>
     <div class="benchmark-board" id="benchmark-history"></div>
@@ -1056,6 +1154,7 @@ let frameCount = 0, lastFpsTime = performance.now();
 let wpPlacementMode = false, obsPlacementMode = false;
 let benchmarkData = null;
 let benchmarkHistory = [];
+let scopeState = null;
 
 socket.on('connect', () => {
   document.getElementById('conn-dot').classList.remove('offline');
@@ -1078,6 +1177,10 @@ socket.on('state', data => {
   lastState = data;
   updateHUD(data);
   updateScene(data);
+  if (data?.scope) {
+    scopeState = data.scope;
+    drawScope(scopeState);
+  }
   if (data?.replay) {
     const duration = Number(data.replay.duration_s || 0);
     const playhead = Number(data.replay.playhead_s || data.time || 0);
@@ -1144,6 +1247,8 @@ socket.on('replay_status', data => {
   document.getElementById('replay-run-label').textContent = String(replay.primary_run_id || 'none');
   const selected = Array.isArray(replay.selected_run_ids) ? replay.selected_run_ids : [];
   document.getElementById('selected-trials-count').textContent = String(selected.length || 0);
+  setOverlayButtons(String(replay.overlay_mode || 'time'));
+  applyScopeSelections(Array.isArray(replay.scope_channels) ? replay.scope_channels : []);
 });
 
 function refreshReplays() {
@@ -1176,6 +1281,46 @@ function selectReplayTrials() {
   socket.emit('select_replay_trials', { run_ids: runIds });
 }
 
+function stepReplayFrame(direction) {
+  socket.emit('step_replay', { step_mode: 'frame', direction: Number(direction) });
+}
+
+function setOverlayButtons(mode) {
+  const m = String(mode || 'time');
+  const bt = document.getElementById('overlay-time');
+  const bn = document.getElementById('overlay-normalized');
+  if (bt) bt.classList.toggle('active', m === 'time');
+  if (bn) bn.classList.toggle('active', m === 'normalized');
+}
+
+function setOverlayMode(mode) {
+  socket.emit('set_overlay_mode', { mode });
+  setOverlayButtons(mode);
+}
+
+function applyScopeSelections(channels) {
+  const sel = document.getElementById('scope-channel-select');
+  const set = new Set((channels || []).map(String));
+  Array.from(sel.options).forEach(opt => {
+    opt.selected = set.has(opt.value);
+  });
+  document.getElementById('scope-channel-count').textContent = String(set.size);
+}
+
+function setScopeChannels() {
+  const sel = document.getElementById('scope-channel-select');
+  const channels = Array.from(sel.selectedOptions).map(opt => opt.value);
+  document.getElementById('scope-channel-count').textContent = String(channels.length);
+  socket.emit('set_scope_channels', { channels });
+}
+
+function setScopePreset() {
+  const sel = document.getElementById('scope-preset-select');
+  const preset = String(sel.value || 'default');
+  document.getElementById('scope-preset-label').textContent = preset;
+  socket.emit('set_scope_preset', { preset });
+}
+
 function updateReplaySelects(trials) {
   const primary = document.getElementById('replay-run-select');
   const compare = document.getElementById('replay-compare-select');
@@ -1193,6 +1338,101 @@ function updateReplaySelects(trials) {
     o2.textContent = label;
     compare.appendChild(o2);
   });
+}
+
+function drawScope(scope) {
+  const canvas = document.getElementById('scope-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(0,16,24,0.9)';
+  ctx.fillRect(0, 0, W, H);
+
+  const channels = Array.isArray(scope?.channels) ? scope.channels : [];
+  const runs = Array.isArray(scope?.runs) ? scope.runs : [];
+  const window = scope?.window || {};
+  const t0 = Number(window.start_s || 0);
+  const t1 = Number(window.end_s || 1);
+  const cursor = Number(window.cursor_s || 0);
+
+  if (!channels.length || !runs.length) {
+    ctx.fillStyle = 'rgba(200,255,232,0.5)';
+    ctx.font = '11px Share Tech Mono';
+    ctx.fillText('No scope data', 10, 20);
+    return;
+  }
+
+  const palette = ['#00ffc8', '#00a8ff', '#ff6b35', '#ffcc00', '#ff2255', '#8ef9f3', '#88ff88', '#f9a8ff'];
+  const allValues = [];
+  runs.forEach(run => {
+    const samples = Array.isArray(run.samples) ? run.samples : [];
+    samples.forEach(s => {
+      channels.forEach(ch => {
+        const v = Number((s.channels || {})[ch]);
+        if (Number.isFinite(v)) allValues.push(v);
+      });
+    });
+  });
+
+  if (!allValues.length) return;
+  let ymin = Math.min(...allValues);
+  let ymax = Math.max(...allValues);
+  if (Math.abs(ymax - ymin) < 1e-6) {
+    ymax += 1.0;
+    ymin -= 1.0;
+  }
+
+  const left = 34;
+  const right = W - 10;
+  const top = 8;
+  const bottom = H - 22;
+
+  ctx.strokeStyle = 'rgba(0,255,200,0.15)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(left, top, right - left, bottom - top);
+
+  const xOf = (t) => left + (Math.max(t0, Math.min(t1, t)) - t0) / Math.max(1e-9, (t1 - t0)) * (right - left);
+  const yOf = (v) => bottom - (v - ymin) / Math.max(1e-9, (ymax - ymin)) * (bottom - top);
+
+  runs.forEach((run, runIdx) => {
+    const samples = Array.isArray(run.samples) ? run.samples : [];
+    channels.forEach((ch, chIdx) => {
+      ctx.strokeStyle = palette[(runIdx + chIdx) % palette.length];
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      let started = false;
+      samples.forEach(s => {
+        const t = Number(s.t);
+        const v = Number((s.channels || {})[ch]);
+        if (!Number.isFinite(t) || !Number.isFinite(v)) return;
+        const x = xOf(t);
+        const y = yOf(v);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      if (started) ctx.stroke();
+    });
+  });
+
+  const cx = xOf(cursor);
+  ctx.strokeStyle = 'rgba(255,107,53,0.8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx, top);
+  ctx.lineTo(cx, bottom);
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(200,255,232,0.7)';
+  ctx.font = '10px Share Tech Mono';
+  ctx.fillText(`y:[${ymin.toFixed(3)}, ${ymax.toFixed(3)}]`, left, H - 8);
+  ctx.fillText(`mode:${String(scope.overlay_mode || 'time')} cursor:${cursor.toFixed(2)}s`, W - 210, H - 8);
 }
 
 function _normalizeBenchmarkCategories(data) {

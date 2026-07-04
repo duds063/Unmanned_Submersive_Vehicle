@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manual-source-mode",
         required=True,
-        choices=["keyboard", "joystick", "udp", "replay"],
+        choices=["keyboard", "joystick", "udp", "replay", "expression"],
         help="Manual input adapter to use.",
     )
     parser.add_argument(

@@ -20,6 +20,7 @@ Convenção de eixos (NED — North-East-Down):
 
 import numpy as np
 from dataclasses import dataclass, field
+from typing import Optional
 from typing import Dict
 
 
@@ -115,8 +116,15 @@ class HydrodynamicCoefficients:
     M_qdot: float = 3.9333    # pitch
     N_rdot: float = 1.1902    # yaw
 
+    # Optional full 6x6 matrices. When present, these override diagonal scalar terms.
+    linear_damping_matrix: Optional[np.ndarray] = None
+    quadratic_damping_matrix: Optional[np.ndarray] = None
+    added_mass_matrix: Optional[np.ndarray] = None
+
     def to_drag_matrix_quadratic(self) -> np.ndarray:
         """Retorna matriz diagonal de arrasto quadrático 6x6."""
+        if self.quadratic_damping_matrix is not None:
+            return np.asarray(self.quadratic_damping_matrix, dtype=float)
         return np.diag([
             self.X_uu, self.Y_vv, self.Z_ww,
             self.K_pp, self.M_qq, self.N_rr
@@ -124,6 +132,8 @@ class HydrodynamicCoefficients:
 
     def to_drag_matrix_linear(self) -> np.ndarray:
         """Retorna matriz diagonal de arrasto linear 6x6."""
+        if self.linear_damping_matrix is not None:
+            return np.asarray(self.linear_damping_matrix, dtype=float)
         return np.diag([
             self.X_u, self.Y_v, self.Z_w,
             self.K_p, self.M_q, self.N_r
@@ -131,6 +141,8 @@ class HydrodynamicCoefficients:
 
     def to_added_mass_matrix(self) -> np.ndarray:
         """Retorna matriz de massa adicionada 6x6."""
+        if self.added_mass_matrix is not None:
+            return np.asarray(self.added_mass_matrix, dtype=float)
         return np.diag([
             self.X_udot, self.Y_vdot, self.Z_wdot,
             self.K_pdot, self.M_qdot, self.N_rdot

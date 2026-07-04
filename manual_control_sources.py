@@ -6,7 +6,9 @@ They can be used with ControlEngine manual mode in both USV and UAV simulations.
 
 from __future__ import annotations
 
+import ast
 import json
+import math
 import socket
 import threading
 from dataclasses import dataclass
@@ -322,6 +324,172 @@ class ReplayManualCommandSource(ManualCommandSource):
         return self.frames[self._index].command
 
 
+class _SafeMathExpression:
+    """Validate and evaluate a restricted math expression over (t, dt, step)."""
+
+    _ALLOWED_NODE_TYPES = {
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Call,
+        ast.Name,
+        ast.Constant,
+        ast.Load,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.Pow,
+        ast.Mod,
+        ast.USub,
+        ast.UAdd,
+        ast.FloorDiv,
+    }
+
+    _ALLOWED_FUNCTIONS = {
+        "sin": np.sin,
+        "cos": np.cos,
+        "tan": np.tan,
+        "exp": np.exp,
+        "sqrt": np.sqrt,
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "clip": np.clip,
+    }
+
+    _ALLOWED_NAMES = {"t", "dt", "step", "pi", "e"}
+
+    def __init__(self, expression: str):
+        self.expression = str(expression)
+        self._code = self._compile(self.expression)
+
+    @classmethod
+    def _compile(cls, expression: str):
+        try:
+            parsed = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"Invalid expression syntax: {exc}") from exc
+
+        for node in ast.walk(parsed):
+            if type(node) not in cls._ALLOWED_NODE_TYPES:
+                raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    raise ValueError("Only direct function calls are allowed")
+                if node.func.id not in cls._ALLOWED_FUNCTIONS:
+                    raise ValueError(f"Function not allowed: {node.func.id}")
+            if isinstance(node, ast.Name):
+                if node.id not in cls._ALLOWED_NAMES and node.id not in cls._ALLOWED_FUNCTIONS:
+                    raise ValueError(f"Name not allowed: {node.id}")
+
+        return compile(parsed, "<manual_expression>", "eval")
+
+    def eval(self, t: float, dt: float, step: int) -> float:
+        env = {
+            "t": float(t),
+            "dt": float(dt),
+            "step": int(step),
+            "pi": float(math.pi),
+            "e": float(math.e),
+        }
+        env.update(self._ALLOWED_FUNCTIONS)
+        value = eval(self._code, {"__builtins__": {}}, env)
+        return float(value)
+
+
+class ExpressionManualCommandSource(ManualCommandSource):
+    """Computes thruster commands from safe math expressions per simulation tick."""
+
+    _CHANNEL_DEFAULTS = {
+        "thruster_power": "0.0",
+        "thruster_theta": "0.0",
+        "thruster_phi": "0.0",
+        "ballast_cmd": "0.0",
+        "thruster2_power": None,
+        "thruster2_theta": None,
+        "thruster2_phi": None,
+    }
+
+    def __init__(
+        self,
+        expressions: Mapping[str, object],
+        max_abs_output: float = 1.0,
+        theta_max_deg: float = 60.0,
+        finite_fallback: float = 0.0,
+    ):
+        self._step = 0
+        self._last_time: Optional[float] = None
+        self.max_abs_output = float(max_abs_output)
+        self.theta_max = float(np.radians(theta_max_deg))
+        self.finite_fallback = float(finite_fallback)
+
+        expr_map = dict(self._CHANNEL_DEFAULTS)
+        for key, value in dict(expressions or {}).items():
+            expr_map[str(key)] = value
+
+        self._compiled: Dict[str, Optional[_SafeMathExpression]] = {}
+        for key in self._CHANNEL_DEFAULTS:
+            expr = expr_map.get(key)
+            if expr is None:
+                self._compiled[key] = None
+            else:
+                self._compiled[key] = _SafeMathExpression(str(expr))
+
+    def _eval_channel(self, channel: str, t: float, dt: float, step: int, default: float) -> float:
+        compiled = self._compiled.get(channel)
+        if compiled is None:
+            return float(default)
+        try:
+            value = float(compiled.eval(t=t, dt=dt, step=step))
+        except Exception:
+            value = self.finite_fallback
+        if not np.isfinite(value):
+            value = self.finite_fallback
+        return float(value)
+
+    def read(self, ekf_state, time_s: float) -> Optional[ControlCommand]:
+        t = float(time_s)
+        if self._last_time is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, t - self._last_time)
+
+        power = np.clip(self._eval_channel("thruster_power", t, dt, self._step, 0.0), -self.max_abs_output, self.max_abs_output)
+        theta = np.clip(self._eval_channel("thruster_theta", t, dt, self._step, 0.0), -self.theta_max, self.theta_max)
+        phi = self._eval_channel("thruster_phi", t, dt, self._step, 0.0)
+        ballast = np.clip(self._eval_channel("ballast_cmd", t, dt, self._step, 0.0), -1.0, 1.0)
+
+        power2_default = power
+        theta2_default = theta
+        phi2_default = phi
+
+        power2 = np.clip(
+            self._eval_channel("thruster2_power", t, dt, self._step, power2_default),
+            -self.max_abs_output,
+            self.max_abs_output,
+        )
+        theta2 = np.clip(
+            self._eval_channel("thruster2_theta", t, dt, self._step, theta2_default),
+            -self.theta_max,
+            self.theta_max,
+        )
+        phi2 = self._eval_channel("thruster2_phi", t, dt, self._step, phi2_default)
+
+        self._step += 1
+        self._last_time = t
+
+        return ControlCommand(
+            thruster_power=float(power),
+            thruster_theta=float(theta),
+            thruster_phi=float(phi),
+            ballast_cmd=float(ballast),
+            thruster2_power=float(power2),
+            thruster2_theta=float(theta2),
+            thruster2_phi=float(phi2),
+        ).clip()
+
+
 def build_manual_source(mode: str, config: Optional[Mapping[str, object]] = None) -> ManualCommandSource:
     """Factory helper for MissionEngine config wiring."""
     cfg = dict(config or {})
@@ -362,6 +530,17 @@ def build_manual_source(mode: str, config: Optional[Mapping[str, object]] = None
             use_time=bool(cfg.get("use_time", True)),
             hold_last=bool(cfg.get("hold_last", True)),
             speed=_to_float(cfg.get("speed", 1.0), 1.0),
+        )
+
+    if name in ("expression", "expr", "function"):
+        expressions = cfg.get("expressions", cfg)
+        if not isinstance(expressions, Mapping):
+            raise ValueError("Expression manual source requires a mapping under 'expressions'.")
+        return ExpressionManualCommandSource(
+            expressions=expressions,
+            max_abs_output=_to_float(cfg.get("max_abs_output", 1.0), 1.0),
+            theta_max_deg=_to_float(cfg.get("theta_max_deg", 60.0), 60.0),
+            finite_fallback=_to_float(cfg.get("finite_fallback", 0.0), 0.0),
         )
 
     raise ValueError(f"Unsupported manual source mode: {mode}")

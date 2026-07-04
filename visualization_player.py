@@ -34,6 +34,14 @@ class VisualizationPlayer:
         self.playing = False
         self.speed = 1.0
         self.playhead_s = 0.0
+        self.overlay_mode = "time"
+        self.scope_channels = ["u", "v", "r", "psi", "ekf_error"]
+        self.scope_presets = {
+            "default": ["u", "v", "r", "psi", "ekf_error"],
+            "attitude": ["phi", "theta", "psi", "r"],
+            "velocity": ["u", "v", "w", "r"],
+        }
+        self.scope_window_s = 12.0
 
         self.refresh_catalog()
 
@@ -161,6 +169,52 @@ class VisualizationPlayer:
             self.playhead_s = max(0.0, min(duration, float(target_s)))
             return self.playhead_s
 
+    def step_frames(self, delta: int = 1) -> float:
+        with self._lock:
+            if not self.primary_run_id:
+                return self.playhead_s
+            self._ensure_loaded(self.primary_run_id)
+            times = self._times_cache.get(self.primary_run_id, [])
+            if not times:
+                return self.playhead_s
+            idx = bisect.bisect_left(times, float(self.playhead_s))
+            if idx >= len(times):
+                idx = len(times) - 1
+            idx = max(0, min(len(times) - 1, idx + int(delta)))
+            self.playhead_s = float(times[idx])
+            self.playing = False
+            return self.playhead_s
+
+    def step_time(self, delta_s: float) -> float:
+        with self._lock:
+            self.playing = False
+            return self.seek_time(self.playhead_s + float(delta_s))
+
+    def set_scope_channels(self, channels: List[str]) -> List[str]:
+        with self._lock:
+            clean = []
+            for ch in channels:
+                token = str(ch).strip().lower()
+                if token and token not in clean:
+                    clean.append(token)
+            self.scope_channels = clean or ["u", "v", "r", "psi", "ekf_error"]
+            return self.scope_channels[:]
+
+    def set_scope_preset(self, name: str) -> List[str]:
+        with self._lock:
+            key = str(name).strip().lower()
+            if key in self.scope_presets:
+                self.scope_channels = self.scope_presets[key][:]
+            return self.scope_channels[:]
+
+    def set_overlay_mode(self, mode: str) -> str:
+        with self._lock:
+            normalized = str(mode).strip().lower()
+            if normalized not in ("time", "normalized"):
+                normalized = "time"
+            self.overlay_mode = normalized
+            return self.overlay_mode
+
     def reset(self) -> None:
         with self._lock:
             self.playhead_s = 0.0
@@ -189,7 +243,8 @@ class VisualizationPlayer:
             trajectory = self._trajectory_window(self.primary_run_id, self.playhead_s, max_points=500)
             envelope = self._envelope_at_time(self.playhead_s)
             errors = self._ekf_error(primary_frame)
-            return self._build_payload(primary_frame, trajectory, envelope, errors)
+            scope = self._scope_payload(self.playhead_s)
+            return self._build_payload(primary_frame, trajectory, envelope, errors, scope)
 
     def status(self) -> dict:
         with self._lock:
@@ -201,6 +256,9 @@ class VisualizationPlayer:
                 "duration_s": duration,
                 "primary_run_id": self.primary_run_id,
                 "selected_run_ids": self.selected_run_ids[:],
+                "overlay_mode": self.overlay_mode,
+                "scope_channels": self.scope_channels[:],
+                "scope_presets": dict(self.scope_presets),
                 "trials": self._list_trials_nolock(),
             }
 
@@ -249,6 +307,72 @@ class VisualizationPlayer:
             return frames[idx - 1]
         return frames[idx]
 
+    def _sample_frame_interpolated(self, run_id: str, target_s: float) -> Optional[dict]:
+        self._ensure_loaded(run_id)
+        frames = self._frames_cache.get(run_id, [])
+        times = self._times_cache.get(run_id, [])
+        if not frames:
+            return None
+        idx = bisect.bisect_left(times, float(target_s))
+        if idx <= 0:
+            return frames[0]
+        if idx >= len(frames):
+            return frames[-1]
+        f0 = frames[idx - 1]
+        f1 = frames[idx]
+        t0 = times[idx - 1]
+        t1 = times[idx]
+        if t1 <= t0:
+            return f0
+        alpha = float((target_s - t0) / (t1 - t0))
+        return self._interpolate_frames(f0, f1, alpha)
+
+    def _interpolate_frames(self, f0: dict, f1: dict, alpha: float) -> dict:
+        a = max(0.0, min(1.0, float(alpha)))
+
+        def lerp_scalar(v0, v1):
+            return (1.0 - a) * float(v0) + a * float(v1)
+
+        def lerp_vec(path: List[str], default: List[float]) -> List[float]:
+            node0 = f0
+            node1 = f1
+            for key in path:
+                node0 = (node0.get(key) if isinstance(node0, dict) else None) or {}
+                node1 = (node1.get(key) if isinstance(node1, dict) else None) or {}
+            try:
+                arr0 = np.asarray(node0, dtype=float)
+                arr1 = np.asarray(node1, dtype=float)
+                if arr0.shape == arr1.shape and arr0.ndim == 1:
+                    return ((1.0 - a) * arr0 + a * arr1).tolist()
+            except Exception:
+                pass
+            return list(default)
+
+        state = {
+            "position": lerp_vec(["state_true", "position"], [0.0, 0.0, 0.0]),
+            "velocity_linear": lerp_vec(["state_true", "velocity_linear"], [0.0, 0.0, 0.0]),
+            "velocity_angular": lerp_vec(["state_true", "velocity_angular"], [0.0, 0.0, 0.0]),
+            "euler": lerp_vec(["state_true", "euler"], [0.0, 0.0, 0.0]),
+            "quaternion": lerp_vec(["state_true", "quaternion"], [1.0, 0.0, 0.0, 0.0]),
+        }
+        ekf_position = lerp_vec(["ekf_estimate", "position"], [0.0, 0.0, 0.0])
+
+        return {
+            "time": lerp_scalar(f0.get("time", 0.0), f1.get("time", 0.0)),
+            "state_true": state,
+            "ekf_estimate": {
+                "position": ekf_position,
+                "orientation": lerp_vec(["ekf_estimate", "orientation"], [0.0, 0.0, 0.0]),
+            },
+            "controller": f1.get("controller", f0.get("controller", "unknown")),
+            "command": f1.get("command", f0.get("command", {})),
+            "vectors": f1.get("vectors", f0.get("vectors", {})),
+            "environment": f1.get("environment", f0.get("environment", {})),
+            "metrics": f1.get("metrics", f0.get("metrics", {})),
+            "metadata": f1.get("metadata", f0.get("metadata", {})),
+            "sensors": f1.get("sensors", f0.get("sensors", {})),
+        }
+
     def _trajectory_window(self, run_id: str, target_s: float, max_points: int = 500) -> List[List[float]]:
         self._ensure_loaded(run_id)
         frames = self._frames_cache.get(run_id, [])
@@ -264,7 +388,13 @@ class VisualizationPlayer:
             return None
         positions = []
         for run_id in self.selected_run_ids:
-            frame = self._frame_at_time(run_id, target_s)
+            if self.overlay_mode == "normalized":
+                duration = self._run_duration(run_id)
+                primary_duration = self._primary_duration()
+                mapped_time = (target_s / max(primary_duration, 1e-9)) * duration if duration > 0.0 else 0.0
+            else:
+                mapped_time = target_s
+            frame = self._sample_frame_interpolated(run_id, mapped_time)
             if frame is None:
                 continue
             positions.append(self._position_from_frame(frame))
@@ -276,6 +406,80 @@ class VisualizationPlayer:
             "max": arr.max(axis=0).tolist(),
             "mean": arr.mean(axis=0).tolist(),
             "sample_count": int(arr.shape[0]),
+        }
+
+    def _run_duration(self, run_id: str) -> float:
+        self._ensure_loaded(run_id)
+        times = self._times_cache.get(run_id, [])
+        return float(times[-1]) if times else 0.0
+
+    @staticmethod
+    def _channel_value(frame: dict, channel: str) -> float:
+        truth = frame.get("state_true", {}) if isinstance(frame, dict) else {}
+        vel_lin = truth.get("velocity_linear") or [0.0, 0.0, 0.0]
+        vel_ang = truth.get("velocity_angular") or [0.0, 0.0, 0.0]
+        euler = truth.get("euler") or [0.0, 0.0, 0.0]
+        ekf = frame.get("ekf_estimate", {}) if isinstance(frame, dict) else {}
+
+        mapping = {
+            "u": float(vel_lin[0]),
+            "v": float(vel_lin[1]),
+            "w": float(vel_lin[2]),
+            "p": float(vel_ang[0]),
+            "q": float(vel_ang[1]),
+            "r": float(vel_ang[2]),
+            "phi": float(euler[0]),
+            "theta": float(euler[1]),
+            "psi": float(euler[2]),
+        }
+
+        if channel == "ekf_error":
+            truth_pos = np.asarray(truth.get("position") or [0.0, 0.0, 0.0], dtype=float)
+            ekf_pos = np.asarray(ekf.get("position") or [0.0, 0.0, 0.0], dtype=float)
+            return float(np.linalg.norm(ekf_pos - truth_pos))
+
+        return float(mapping.get(channel, 0.0))
+
+    def _scope_payload(self, target_s: float) -> dict:
+        half = 0.5 * float(self.scope_window_s)
+        window_start = max(0.0, target_s - half)
+        window_end = target_s + half
+        channels = self.scope_channels[:]
+
+        overlay_points = []
+        primary_duration = self._primary_duration()
+        for run_id in self.selected_run_ids:
+            duration = self._run_duration(run_id)
+            samples = []
+            self._ensure_loaded(run_id)
+            times = self._times_cache.get(run_id, [])
+            for t in times:
+                if t < window_start or t > window_end:
+                    continue
+                if self.overlay_mode == "normalized" and primary_duration > 0.0 and duration > 0.0:
+                    source_t = (t / primary_duration) * duration
+                else:
+                    source_t = t
+                frame = self._sample_frame_interpolated(run_id, source_t)
+                if frame is None:
+                    continue
+                sample = {"t": float(t), "channels": {}}
+                for ch in channels:
+                    sample["channels"][ch] = self._channel_value(frame, ch)
+                samples.append(sample)
+            overlay_points.append({
+                "run_id": run_id,
+                "controller": self._catalog.get(run_id).controller if run_id in self._catalog else "unknown",
+                "trial": self._catalog.get(run_id).trial if run_id in self._catalog else 0,
+                "samples": samples,
+            })
+
+        return {
+            "channels": channels,
+            "overlay_mode": self.overlay_mode,
+            "window": {"start_s": window_start, "end_s": window_end, "cursor_s": target_s},
+            "runs": overlay_points,
+            "presets": dict(self.scope_presets),
         }
 
     @staticmethod
@@ -292,7 +496,7 @@ class VisualizationPlayer:
             "ekf_position_error_vector": (est - truth).tolist(),
         }
 
-    def _build_payload(self, frame: dict, trajectory: List[List[float]], envelope: Optional[dict], errors: dict) -> dict:
+    def _build_payload(self, frame: dict, trajectory: List[List[float]], envelope: Optional[dict], errors: dict, scope: dict) -> dict:
         truth = frame.get("state_true", {})
         sensors = frame.get("sensors", {})
         command = frame.get("command", {})
@@ -370,6 +574,7 @@ class VisualizationPlayer:
                 "thrust_starboard": vectors.get("thrust_starboard") or [0.0, 0.0, 0.0],
             },
             "comparison_envelope": envelope,
+            "scope": scope,
         }
 
 

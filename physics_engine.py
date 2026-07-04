@@ -294,6 +294,10 @@ class PhysicsEngine:
     ):
         self.rho   = rho
         self.planar_dof = bool(planar_dof)
+        # Optional full-matrix hydro terms from profile.
+        self._full_linear_damping_matrix = None
+        self._full_quadratic_damping_matrix = None
+        self._full_added_mass_matrix = None
 
         if geometry is None:
             if vehicle_profile is None:
@@ -461,6 +465,19 @@ class PhysicsEngine:
         quadratic = hydro.get("quadratic_damping_matrix")
         added_mass = hydro.get("added_mass_6x6")
 
+        def matrix_6x6_or_none(matrix):
+            try:
+                arr = np.asarray(matrix, dtype=float)
+                if arr.shape != (6, 6):
+                    return None
+                return arr
+            except Exception:
+                return None
+
+        self._full_linear_damping_matrix = matrix_6x6_or_none(linear)
+        self._full_quadratic_damping_matrix = matrix_6x6_or_none(quadratic)
+        self._full_added_mass_matrix = matrix_6x6_or_none(added_mass)
+
         return HydrodynamicCoefficients(
             X_uu=diag_from_matrix(quadratic, 0),
             Y_vv=diag_from_matrix(quadratic, 1),
@@ -480,6 +497,9 @@ class PhysicsEngine:
             K_pdot=diag_from_matrix(added_mass, 3),
             M_qdot=diag_from_matrix(added_mass, 4),
             N_rdot=diag_from_matrix(added_mass, 5),
+            linear_damping_matrix=self._full_linear_damping_matrix,
+            quadratic_damping_matrix=self._full_quadratic_damping_matrix,
+            added_mass_matrix=self._full_added_mass_matrix,
         )
 
     # ─── Interface pública ───────────────────
@@ -631,10 +651,7 @@ class PhysicsEngine:
             Izz = Iyy                                       # yaw — simetria
 
             M_rigid = np.diag([m, m, m, Ixx, Iyy, Izz])
-        M_added = np.diag([
-            c.X_udot, c.Y_vdot, c.Z_wdot,
-            c.K_pdot, c.M_qdot, c.N_rdot
-        ])
+        M_added = c.to_added_mass_matrix()
 
         return M_rigid + M_added
 
@@ -755,7 +772,8 @@ class PhysicsEngine:
         """
         D_lin  = self.coeff.to_drag_matrix_linear()
         D_quad = self.coeff.to_drag_matrix_quadratic()
-        D_nonl = np.diag(D_quad.diagonal() * np.abs(nu))
+        # Generalized quadratic damping with full 6x6 coupling.
+        D_nonl = D_quad @ np.diag(np.abs(nu))
         return D_lin + D_nonl
 
     def _restoring_forces(self, eta: np.ndarray) -> np.ndarray:

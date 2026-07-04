@@ -257,13 +257,9 @@ class ControllerBenchmark:
         if scenario.vehicle_profile_csv:
             profile = load_vehicle_profile(scenario.vehicle_profile_csv)
             geo = GeometryEngine(L=profile.length_m, D=profile.beam_m)
-            physics = PhysicsEngine(
-                geo,
+            physics = PhysicsEngine.from_vehicle_profile(
+                vehicle_profile=profile,
                 max_thruster_force=10.0,
-                rigid_body_mass=profile.mass_kg,
-                rigid_body_inertia=profile.inertia_kgm2,
-                thruster_port_position=profile.thruster_port_position_m,
-                thruster_starboard_position=profile.thruster_starboard_position_m,
                 planar_dof=scenario.planar_dof,
             )
         else:
