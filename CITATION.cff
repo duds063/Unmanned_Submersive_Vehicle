@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Se este software for útil à sua pesquisa, cite-o conforme abaixo."
+title: "USV Digital Twin: Banco de Provas Virtual para Veículos Marinhos Autônomos"
+type: software
+authors:
+  - family-names: "Souza Costa"
+    given-names: "Eduardo"
+  - family-names: "Valdiero Medeiros"
+    given-names: "Marcelo Henrique"
+repository-code: "https://github.com/duds063/Unmanned_Submersive_Vehicle"
+license: PolyForm-Noncommercial-1.0.0
+keywords:
+  - digital twin
+  - USV
+  - marine robotics
+  - Fossen
+  - extended Kalman filter
+  - reinforcement learning
+  - simulation
