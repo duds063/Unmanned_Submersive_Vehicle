@@ -3,10 +3,10 @@
 # USV Digital Twin
 ### Banco de Provas Virtual para Veículos Marinhos Autônomos
 
-[![Status](https://img.shields.io/badge/Status-Operacional-brightgreen)]()
+[![Status](https://img.shields.io/badge/Status-Operational-brightgreen)]()
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)]()
-[![License: AGPL](https://img.shields.io/badge/License-AGPL_v3%2B-blue)](LICENSE)
-[![Validação](https://img.shields.io/badge/Valida%C3%A7%C3%A3o-Otter%20USV%20(Fossen)%20%E2%89%A4%200.8%25%20RMS-gold)](docs/VALIDATION.md)
+[![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
+[![Validation](https://img.shields.io/badge/Validation-Otter%20USV%20(Fossen)%20%E2%89%A4%200.8%25%20RMS-gold)](docs/VALIDATION.md)
 
 **Gêmeo digital de alta fidelidade para projetar, simular e validar veículos autônomos de superfície (USV) — antes de qualquer campanha de mar.**
 
@@ -130,7 +130,16 @@ Se este projeto for útil à sua pesquisa, cite-o (ver [`CITATION.cff`](CITATION
 
 ## Licença e autores
 
-Distribuído sob a licença [MIT](LICENSE).
+Este projeto adota um **modelo de licenciamento duplo**:
 
+- **Uso não comercial — livre.** O código é disponibilizado sob a
+  [PolyForm Noncommercial License 1.0.0](LICENSE): pesquisa, ensino, estudo pessoal,
+  projetos sem fins lucrativos e **instituições governamentais** podem usar, modificar
+  e distribuir livremente.
+- **Uso comercial — sob licença negociada.** Empresas que desejem incorporar o software
+  em produtos ou serviços com fins lucrativos devem obter uma licença comercial junto
+  aos titulares — veja [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
+
+> **Nota:** versões anteriores publicadas sob outra licença permanecem regidas pelos termos vigentes à época da respectiva distribuição. A partir desta versão, aplica-se a PolyForm Noncommercial 1.0.0.
 Desenvolvido por **Eduardo Souza Costa** e **Marcelo Henrique Valdiero Medeiros**.
 Contribuições são bem-vindas — veja [`CONTRIBUTING.md`](CONTRIBUTING.md).
