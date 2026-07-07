@@ -5,7 +5,7 @@
 
 [![Status](https://img.shields.io/badge/Status-Operacional-brightgreen)]()
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)]()
-[![License: MIT]([https://img.shields.io/badge/License-MIT-green](https://img.shields.io/badge/License-AGPL_v3%2B-blue))](LICENSE)
+[![License: AGPL][(https://img.shields.io/badge/License-AGPL_v3%2B-blue)](LICENSE)
 [![Validação](https://img.shields.io/badge/Valida%C3%A7%C3%A3o-Otter%20USV%20(Fossen)%20%E2%89%A4%200.8%25%20RMS-gold)](docs/VALIDATION.md)
 
 **Gêmeo digital de alta fidelidade para projetar, simular e validar veículos autônomos de superfície (USV) — antes de qualquer campanha de mar.**
