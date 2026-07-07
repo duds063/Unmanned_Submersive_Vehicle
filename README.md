@@ -141,5 +141,5 @@ Este projeto adota um **modelo de licenciamento duplo**:
   aos titulares — veja [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
 
 > **Nota:** versões anteriores publicadas sob outra licença permanecem regidas pelos termos vigentes à época da respectiva distribuição. A partir desta versão, aplica-se a PolyForm Noncommercial 1.0.0.
-Desenvolvido por **Eduardo Souza Costa** e **Marcelo Henrique Valdiero Medeiros**.
+Desenvolvido por **Eduardo Souza Costa**.
 Contribuições são bem-vindas — veja [`CONTRIBUTING.md`](CONTRIBUTING.md).
