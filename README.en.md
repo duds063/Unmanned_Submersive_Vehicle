@@ -137,5 +137,5 @@ This project uses a **dual licensing model**:
 
 > **Note:** earlier versions published under a different license remain governed by the terms in force at the time of their distribution. From this version onward, PolyForm Noncommercial 1.0.0 applies.
 
-Developed by **Eduardo Souza Costa** and **Marcelo Henrique Valdiero Medeiros**.
+Developed by **Eduardo Souza Costa**.
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
