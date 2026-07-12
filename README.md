@@ -134,8 +134,7 @@ Este projeto adota um **modelo de licenciamento duplo**:
 
 - **Uso não comercial — livre.** O código é disponibilizado sob a
   [PolyForm Noncommercial License 1.0.0](LICENSE): pesquisa, ensino, estudo pessoal,
-  projetos sem fins lucrativos e **instituições governamentais** podem usar, modificar
-  e distribuir livremente.
+  projetos sem fins lucrativos e **instituições governamentais** podem usar livremente.
 - **Uso comercial — sob licença negociada.** Empresas que desejem incorporar o software
   em produtos ou serviços com fins lucrativos devem obter uma licença comercial junto
   aos titulares — veja [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
