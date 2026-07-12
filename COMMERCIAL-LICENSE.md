@@ -20,7 +20,7 @@ valor único por projeto.
 
 **Contato para licenciamento:**
 - Eduardo Souza Costa e Marcelo Henrique Valdiero Medeiros
-- [inserir e-mail de contato]
+- scostaeduardo10@gmail.com
 - https://github.com/duds063/Unmanned_Submersive_Vehicle
 
 ## English
