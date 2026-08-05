@@ -411,6 +411,8 @@ class PhysicsEngine:
         # previous environmental current (para derivada temporal)
         self._prev_env_current_body = self._env_current_body.copy()
         self._env_dt = 0.0
+        # esforço externo generalizado injetado diretamente (opcional)
+        self._external_wrench_body = None
 
     @classmethod
     def from_vehicle_profile(
@@ -530,6 +532,7 @@ class PhysicsEngine:
         env_current_world: Optional[np.ndarray] = None,
         env_turbulence: float = 0.0,
         env_harmonics: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
+        external_wrench_body: Optional[np.ndarray] = None,
     ) -> VehicleState:
         """
         Avança a simulação por um timestep dt.
@@ -541,6 +544,10 @@ class PhysicsEngine:
             ballast_cmd:    [-1, 1] — -1 expele, +1 injeta água
             thruster2_power/theta/phi: comandos do thruster 2 (opcional)
             dt:             timestep em segundos
+            external_wrench_body: força/momento generalizado [Fx,Fy,Fz,Tx,Ty,Tz] no
+                referencial do corpo, somado diretamente a τ (contorna o modelo de
+                propulsor). Usado para injeção direta de esforços — ex.: validação
+                cruzada contra modelos de referência e testes SIL.
 
         Returns:
             Novo estado do veículo
@@ -605,6 +612,11 @@ class PhysicsEngine:
         else:
             self._env_current_body = np.zeros(3, dtype=float)
         self._env_turbulence = float(env_turbulence)
+        # esforço externo generalizado injetado diretamente em τ (opcional)
+        if external_wrench_body is not None:
+            self._external_wrench_body = np.asarray(external_wrench_body, dtype=float).reshape(6)
+        else:
+            self._external_wrench_body = None
         # if harmonics provided, convert them to body frame once (freqs, amps, phases, dirs)
         self._env_harmonics_body = None
         if env_harmonics is not None:
@@ -738,25 +750,29 @@ class PhysicsEngine:
         u, v, w = nu[0], nu[1], nu[2]
         p, q, r = nu[3], nu[4], nu[5]
 
-        # usa uma massa translacional única no acoplamento de Coriolis.
-        # Isso preserva o cancelamento físico em translação pura e evita
-        # torque espúrio em pitch/roll por diferenças entre eixos.
-        m_trans = m
+        # Massas translacionais efetivas por eixo = massa de corpo rígido + massa
+        # adicionada correspondente. Incluir a massa adicionada no acoplamento de
+        # Coriolis (C_A) reproduz a formulação completa de Fossen (2011, Teorema 3.2),
+        # inclusive o momento de Munk que surge quando as massas por eixo diferem.
+        # Validado contra o modelo Otter (ver otter/otter_validation.py / docs/VALIDATION.md).
+        m11 = m + c.X_udot
+        m22 = m + c.Y_vdot
+        m33 = m + c.Z_wdot
         m44 = 0.5*m*R**2         + c.K_pdot
         m55 = (1/12)*m*(3*R**2+L**2) + c.M_qdot
         m66 = m55                + c.N_rdot
 
         C = np.zeros((6, 6))
 
-        # bloco superior direito
-        C[0, 3] =  0;         C[0, 4] =  m_trans*w;  C[0, 5] = -m_trans*v
-        C[1, 3] = -m_trans*w; C[1, 4] =  0;          C[1, 5] =  m_trans*u
-        C[2, 3] =  m_trans*v; C[2, 4] = -m_trans*u;  C[2, 5] =  0
+        # bloco superior direito  = -S(M11 ν1),  ν1 = [u, v, w]
+        C[0, 3] =  0;      C[0, 4] =  m33*w;  C[0, 5] = -m22*v
+        C[1, 3] = -m33*w;  C[1, 4] =  0;      C[1, 5] =  m11*u
+        C[2, 3] =  m22*v;  C[2, 4] = -m11*u;  C[2, 5] =  0
 
-        # bloco inferior esquerdo (transposto negativo)
-        C[3, 0] =  0;         C[3, 1] =  m_trans*w;  C[3, 2] = -m_trans*v
-        C[4, 0] = -m_trans*w; C[4, 1] =  0;          C[4, 2] =  m_trans*u
-        C[5, 0] =  m_trans*v; C[5, 1] = -m_trans*u;  C[5, 2] =  0
+        # bloco inferior esquerdo (mesma forma -S(M11 ν1))
+        C[3, 0] =  0;      C[3, 1] =  m33*w;  C[3, 2] = -m22*v
+        C[4, 0] = -m33*w;  C[4, 1] =  0;      C[4, 2] =  m11*u
+        C[5, 0] =  m22*v;  C[5, 1] = -m11*u;  C[5, 2] =  0
 
         # bloco inferior direito
         C[3, 4] =  m66*r;   C[3, 5] = -m55*q
@@ -825,6 +841,10 @@ class PhysicsEngine:
         tau = np.zeros(6, dtype=float)
         for th in self.thrusters:
             tau = tau + th.wrench_body
+
+        # esforço externo generalizado injetado diretamente (validação/SIL)
+        if getattr(self, "_external_wrench_body", None) is not None:
+            tau = tau + self._external_wrench_body
 
         # aumenta efeito do arrasto com turbulência
         if self._env_turbulence > 0.0:

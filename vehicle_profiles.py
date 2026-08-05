@@ -102,6 +102,87 @@ def load_vtec_s4_profile(csv_path: str | Path | None = None) -> VehicleProfile:
     return _vtec_s4_base_profile(source_path=source_path)
 
 
+def _import_otter_reference():
+    """Lazily import the Otter reference model (lives in ``otter/``) as the single
+    source of truth for the Otter physical parameters. Kept lazy so importing this
+    module never depends on ``otter/`` being on ``sys.path``."""
+    import sys as _sys
+    import os as _os
+
+    otter_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "otter")
+    if otter_dir not in _sys.path:
+        _sys.path.insert(0, otter_dir)
+    import otter_reference as _otr  # noqa: E402
+    return _otr
+
+
+def load_otter_profile(source_path: str | Path | None = None) -> VehicleProfile:
+    """Return the Fossen Otter profile used for the T0.1 validation regression test.
+
+    The hydrodynamic terms are packed as full 6x6 matrices under ``metadata['hydro']`` so
+    that :meth:`PhysicsEngine._build_coefficients_from_vehicle_profile` reproduces exactly
+    the Otter mass/damping used by the independent reference model in
+    ``tools/otter_reference.py``. Only surge/sway/yaw entries are populated (the engine runs
+    with ``planar_dof=True`` for this comparison); heave/roll/pitch entries are 0.
+
+    ``displaced_volume_m3`` is set to ``mass/rho`` (neutral buoyancy) so the engine's ballast
+    system reports ``mass_min == 0`` and the total mass stays constant through the run.
+    """
+    otr = _import_otter_reference()
+    normalized_source = None if source_path is None else str(Path(source_path))
+
+    linear_damping = [[0.0] * 6 for _ in range(6)]
+    linear_damping[0][0] = float(otr.D_SURGE_LIN)
+    linear_damping[1][1] = float(otr.D_SWAY_LIN)
+    linear_damping[5][5] = float(otr.D_YAW_LIN)
+
+    quadratic_damping = [[0.0] * 6 for _ in range(6)]
+    quadratic_damping[5][5] = float(otr.D_YAW_QUAD)
+
+    added_mass = [[0.0] * 6 for _ in range(6)]
+    added_mass[0][0] = float(otr.XUDOT_EFF)
+    added_mass[1][1] = float(otr.YVDOT_EFF)
+    added_mass[5][5] = float(otr.NRDOT_EFF)
+
+    rho = 1000.0  # engine default (freshwater); only enters buoyancy, inert in planar DOF.
+    metadata = {
+        "hydro": {
+            "linear_damping_matrix": linear_damping,
+            "quadratic_damping_matrix": quadratic_damping,
+            "added_mass_6x6": added_mass,
+            "displaced_volume_m3": float(otr.M_TOTAL) / rho,
+            "include_added_mass": True,
+            "include_damping": True,
+            "include_restoring": True,
+        },
+        "reference_model": "tools/otter_reference.py",
+    }
+
+    ixx = float(otr.M_TOTAL) * (0.4 * otr.B) ** 2
+    iyy = float(otr.M_TOTAL) * (0.25 * otr.L) ** 2
+    izz = float(otr.IZ)
+
+    return VehicleProfile(
+        name="Otter",
+        mass_kg=float(otr.M_TOTAL),
+        inertia_kgm2=_array([
+            [ixx, 0.0, 0.0],
+            [0.0, iyy, 0.0],
+            [0.0, 0.0, izz],
+        ]),
+        length_m=float(otr.L),
+        beam_m=float(otr.B) / 2.0,
+        beam_total_m=float(otr.B),
+        draft_m=0.09,
+        thruster_port_position_m=_array([0.0, +float(otr.THRUSTER_ARM_Y), 0.0]),
+        thruster_starboard_position_m=_array([0.0, -float(otr.THRUSTER_ARM_Y), 0.0]),
+        cog_position_m=_array([0.0, 0.0, 0.0]),
+        cob_position_m=_array([0.0, 0.0, 0.0]),
+        source_path=normalized_source,
+        metadata=metadata,
+    )
+
+
 def load_taluy_profile(source_path: str | Path | None = None) -> VehicleProfile:
     """Return the Taluy profile described by the provided vehicle data."""
     normalized_source = None if source_path is None else str(Path(source_path))
